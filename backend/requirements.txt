@@ -1,0 +1,11 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pymavlink>=2.4.42
+opencv-python>=4.10
+numpy>=1.26,<3
+python-dotenv>=1.0
+aiofiles>=24.1
+
+# Google Drive support
+google-api-python-client>=2.140
+google-auth>=2.30

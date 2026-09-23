@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no" />
+  <meta name="theme-color" content="#0b1116" />
+  <title>Puray Drone GCS</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <div class="title">PURAY DRONE GCS</div>
+      <div class="subtitle">Autonomous Upland Plant Monitoring</div>
+    </div>
+    <div class="header-actions">
+      <span id="linkBadge" class="badge bad">MAVLINK OFFLINE</span>
+      <input id="tokenInput" class="token-input" type="password" placeholder="Control token" />
+      <button id="saveTokenBtn" class="secondary">CONNECT</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel camera-panel">
+      <div class="panel-title">REAL-TIME CAMERA / EDGE AI</div>
+      <div class="camera-wrap">
+        <img id="cameraFeed" src="/video_feed" alt="Live camera" />
+        <div class="camera-overlay">
+          <span id="modeOverlay">MODE: --</span>
+          <span id="gpsOverlay">GPS: --</span>
+          <span id="batteryOverlay">BAT: --</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel map-panel">
+      <div class="panel-title">LIVE GPS TRACK — OFFLINE SAFE</div>
+      <canvas id="mapCanvas"></canvas>
+      <div class="map-readout">
+        <span>LAT <b id="latVal">--</b></span>
+        <span>LON <b id="lonVal">--</b></span>
+        <span>ALT <b id="altVal">--</b></span>
+        <span>SPD <b id="speedVal">--</b></span>
+      </div>
+    </section>
+
+    <section class="panel telemetry-panel">
+      <div class="panel-title">FLIGHT TELEMETRY</div>
+      <div class="telemetry-grid">
+        <div><small>Battery</small><strong id="batteryVal">--</strong></div>
+        <div><small>GPS sats</small><strong id="gpsVal">--</strong></div>
+        <div><small>Flight mode</small><strong id="modeVal">--</strong></div>
+        <div><small>Armed</small><strong id="armedVal">--</strong></div>
+        <div><small>Voltage</small><strong id="voltageVal">--</strong></div>
+        <div><small>Heading</small><strong id="headingVal">--</strong></div>
+      </div>
+
+      <div class="mode-row">
+        <select id="modeSelect">
+          <option>LOITER</option>
+          <option>GUIDED</option>
+          <option>AUTO</option>
+          <option>RTL</option>
+          <option>LAND</option>
+          <option>STABILIZE</option>
+        </select>
+        <button id="setModeBtn" class="secondary">SET MODE</button>
+      </div>
+    </section>
+
+    <section class="panel actions-panel">
+      <div class="panel-title">QUICK ACTIONS</div>
+      <div class="action-grid">
+        <button data-command="ARM" class="good">ARM</button>
+        <button data-command="TAKEOFF" class="primary">TAKEOFF</button>
+        <button data-command="RTL" class="warn">RTL</button>
+        <button data-command="LAND" class="warn">LAND</button>
+        <button data-command="DISARM" class="secondary">DISARM</button>
+        <button data-command="EMERGENCY_STOP" class="danger">EMERGENCY STOP</button>
+      </div>
+      <label class="manual-toggle">
+        <input id="manualToggle" type="checkbox" />
+        Enable manual joystick control
+      </label>
+      <p class="safety-note">Airborne “Emergency Stop” requests LAND; motor kill is blocked unless the vehicle reports on-ground.</p>
+    </section>
+
+    <section class="panel joystick-panel">
+      <div class="panel-title">VIRTUAL JOYSTICKS</div>
+      <div class="sticks">
+        <div>
+          <div id="leftStick" class="stick"><div class="knob"></div></div>
+          <small>Throttle / Yaw</small>
+        </div>
+        <div>
+          <div id="rightStick" class="stick"><div class="knob"></div></div>
+          <small>Pitch / Roll</small>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel analytics-panel">
+      <div class="panel-title">CROP HEALTH ANALYTICS</div>
+      <div id="analyticsCards" class="analytics-cards"></div>
+    </section>
+
+    <section class="panel logs-panel">
+      <div class="panel-title">SYSTEM LOG</div>
+      <div id="systemLog" class="system-log"></div>
+    </section>
+
+    <section id="syncPanel" class="panel sync-panel hidden">
+      <div>
+        <div class="panel-title">STORE-AND-FORWARD READY</div>
+        <div id="syncText">Home Wi-Fi detected. Unsynced flight data is available.</div>
+      </div>
+      <button id="syncBtn" class="primary">SYNC TO GOOGLE DRIVE</button>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
