@@ -199,9 +199,9 @@ function renderAnalytics(data) {
   const host = $("analyticsCards");
 
   const crops = [
-    "gabi",
-    "saging",
-    "palay"
+    "okra",
+    "talong",
+    "sili"
   ];
 
   host.innerHTML = crops

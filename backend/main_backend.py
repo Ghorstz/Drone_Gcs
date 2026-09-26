@@ -165,7 +165,7 @@ class MavlinkBridge:
         # Filled by your ML pipeline; None means "not yet computed".
         self.crop_health: Dict[str, Dict[str, Optional[float]]] = {
             crop: {"healthy": None, "wilting": None, "disease": None, "pest": None}
-            for crop in ("gabi", "saging", "palay")
+            for crop in ("okra", "talong", "sili")
         }
 
     def log(self, message: str, level: str = "INFO"):

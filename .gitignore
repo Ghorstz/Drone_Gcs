@@ -9,13 +9,23 @@ __pycache__/
 
 # Environment variables / secrets
 .env
+*.env
+
+# Local database
+data/drone.db
+*.db
+
+# AI datasets / raw images
+ai_training/raw/
+
+# Training outputs
+ai_training/runs/
+runs/
+*.pt
 
 # VS Code
 .vscode/
 
-# Operating system files
+# OS files
 .DS_Store
 Thumbs.db
-
-# ML temporary output
-runs/
