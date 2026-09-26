@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import math
 import os
 import sqlite3
 import subprocess
@@ -13,6 +14,7 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
+from uuid import uuid4
 
 import cv2
 import numpy as np
@@ -41,6 +43,8 @@ CONTROL_TOKEN = os.getenv("CONTROL_TOKEN", "dev-only-change-me")
 HOME_SSID = os.getenv("HOME_SSID", "")
 CONTROL_LINK_TIMEOUT_S = float(os.getenv("CONTROL_LINK_TIMEOUT_S", "2.0"))
 TAKEOFF_ALT_M = float(os.getenv("TAKEOFF_ALT_M", "5.0"))
+TELEMETRY_MAX_AGE_S = float(os.getenv("TELEMETRY_MAX_AGE_S", "3.0"))
+COMMAND_TIMEOUT_S = float(os.getenv("COMMAND_TIMEOUT_S", "8.0"))
 
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "")
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
@@ -136,10 +140,13 @@ class MavlinkBridge:
         self.stop_event = threading.Event()
         self.state_lock = threading.Lock()
         self.write_lock = threading.Lock()
+        self.log_lock = threading.Lock()
         self.connected = False
         self.last_msg_monotonic = 0.0
         self.logs = deque(maxlen=150)
         self.last_command_ack: Optional[dict] = None
+        self.message_times: Dict[str, float] = {}
+        self.command_acks = deque(maxlen=100)
 
         self.state: Dict[str, Any] = {
             "armed": False,
@@ -170,7 +177,8 @@ class MavlinkBridge:
 
     def log(self, message: str, level: str = "INFO"):
         item = {"ts": utc_iso(), "level": level, "message": message}
-        self.logs.append(item)
+        with self.log_lock:
+            self.logs.append(item)
         store.add_log(level, message)
         print(f"[{level}] {message}")
 
@@ -195,6 +203,10 @@ class MavlinkBridge:
         hb = self.master.wait_heartbeat(timeout=12)
         if hb is None:
             raise TimeoutError("No flight-controller heartbeat received")
+        with self.state_lock:
+            self.message_times.clear()
+            self.command_acks.clear()
+        self._handle_msg(hb)
         self.connected = True
         self.log(
             f"MAVLink heartbeat received: system={self.master.target_system}, "
@@ -211,8 +223,6 @@ class MavlinkBridge:
                     if time.monotonic() - self.last_msg_monotonic > 3.0:
                         self.connected = False
                     continue
-                self.last_msg_monotonic = time.monotonic()
-                self.connected = True
                 self._handle_msg(msg)
             except Exception as exc:
                 self.connected = False
@@ -229,8 +239,18 @@ class MavlinkBridge:
         t = msg.get_type()
         if t == "BAD_DATA":
             return
+        # Ignore other vehicles/components, including another GCS heartbeat.
+        if self.master is None or (
+            msg.get_srcSystem() != self.master.target_system
+            or msg.get_srcComponent() != self.master.target_component
+        ):
+            return
 
         with self.state_lock:
+            now = time.monotonic()
+            self.last_msg_monotonic = now
+            self.message_times[t] = now
+            self.connected = True
             if t == "HEARTBEAT":
                 self.state["armed"] = bool(
                     msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
@@ -275,19 +295,22 @@ class MavlinkBridge:
                     "result": int(msg.result),
                     "ts": utc_iso(),
                 }
+                self.command_acks.append((now, dict(self.last_command_ack)))
                 self.log(f"COMMAND_ACK command={msg.command} result={msg.result}")
 
     def snapshot(self) -> Dict[str, Any]:
         with self.state_lock:
             state = dict(self.state)
             analytics = json.loads(json.dumps(self.crop_health))
+        with self.log_lock:
+            logs = list(self.logs)[-30:]
         return {
             "type": "telemetry",
             "ts": utc_iso(),
-            "mavlink_connected": self.connected,
+            "mavlink_connected": self.connected and self.is_fresh("HEARTBEAT"),
             "telemetry": state,
             "crop_health": analytics,
-            "logs": list(self.logs)[-30:],
+            "logs": logs,
             "last_command_ack": self.last_command_ack,
         }
 
@@ -295,8 +318,27 @@ class MavlinkBridge:
         if self.master is None or not self.connected:
             raise RuntimeError("Flight controller is not connected over MAVLink")
 
-    def _send_command_long(self, command: int, params=None):
+    def is_fresh(self, message_type: str) -> bool:
+        with self.state_lock:
+            received = self.message_times.get(message_type)
+        return received is not None and time.monotonic() - received <= TELEMETRY_MAX_AGE_S
+
+    def require_fresh(self, *message_types: str):
         self._require_link()
+        for message_type in ("HEARTBEAT", *message_types):
+            if not self.is_fresh(message_type):
+                raise RuntimeError(f"Missing/stale {message_type} telemetry; command blocked")
+
+    def require_preflight(self):
+        self.require_fresh("SYS_STATUS", "GPS_RAW_INT")
+        snap = self.snapshot()["telemetry"]
+        if snap["battery_pct"] is None or snap["battery_pct"] < 20:
+            raise RuntimeError("Battery unknown or below 20%; command blocked")
+        if snap["gps_fix"] is None or snap["gps_fix"] < 3:
+            raise RuntimeError("GPS needs a current 3D fix; command blocked")
+
+    def _send_command_long(self, command: int, params=None):
+        self.require_fresh()
         p = list(params or []) + [0.0] * 7
         with self.write_lock:
             self.master.mav.command_long_send(
@@ -308,13 +350,7 @@ class MavlinkBridge:
             )
 
     def arm(self):
-        snap = self.snapshot()["telemetry"]
-        battery = snap.get("battery_pct")
-        fix = snap.get("gps_fix")
-        if battery is not None and battery < 20:
-            raise RuntimeError("ARM blocked: battery below 20%")
-        if fix is not None and fix < 3:
-            raise RuntimeError("ARM blocked: GPS does not have a 3D fix")
+        self.require_preflight()
         self._send_command_long(
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             [1.0, 0.0],
@@ -329,7 +365,7 @@ class MavlinkBridge:
         self.log("DISARM command sent")
 
     def set_mode(self, mode: str):
-        self._require_link()
+        self.require_fresh()
         mode = mode.upper()
         mapping = self.master.mode_mapping() or {}
         if mode not in mapping:
@@ -344,11 +380,14 @@ class MavlinkBridge:
         self.log(f"SET_MODE {mode} sent")
 
     def takeoff(self, altitude_m: float = TAKEOFF_ALT_M):
+        self.require_preflight()
+        if not math.isfinite(altitude_m) or altitude_m <= 0:
+            raise ValueError("Takeoff altitude must be a finite positive number")
         snap = self.snapshot()["telemetry"]
         if not snap.get("armed"):
             raise RuntimeError("TAKEOFF blocked: vehicle is not armed")
-        self.set_mode("GUIDED")
-        time.sleep(0.35)
+        if snap.get("mode") != "GUIDED":
+            raise RuntimeError("TAKEOFF blocked: GUIDED mode is not confirmed")
         self._send_command_long(
             mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
             [0, 0, 0, 0, 0, 0, float(altitude_m)],
@@ -367,7 +406,9 @@ class MavlinkBridge:
         - If on ground, disarm.
         - If airborne/unknown, DO NOT force-kill motors; command LAND instead.
         """
-        landed = self.snapshot()["telemetry"].get("landed_state")
+        self.require_fresh()
+        landed = (self.snapshot()["telemetry"].get("landed_state")
+                  if self.is_fresh("EXTENDED_SYS_STATE") else None)
         on_ground = landed == mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND
         if on_ground:
             self.disarm()
@@ -378,7 +419,7 @@ class MavlinkBridge:
         return "land"
 
     def manual_control(self, x: int, y: int, z: int, r: int):
-        self._require_link()
+        self.require_fresh()
         x = max(-1000, min(1000, int(x)))
         y = max(-1000, min(1000, int(y)))
         z = max(0, min(1000, int(z)))
@@ -413,6 +454,150 @@ class MavlinkBridge:
 
 
 bridge = MavlinkBridge()
+
+
+class ControlCoordinator:
+    """Process-wide ownership; accessed only by the ASGI event loop.
+
+    Run one Uvicorn worker: the MAVLink connection and lease belong to this process.
+    """
+
+    def __init__(self):
+        self.owner: Optional[str] = None
+        self.last_heartbeat = 0.0
+        self.releasing = False
+        self.command_task: Optional[asyncio.Task] = None
+        self.command_session: Optional[str] = None
+        self.command_switching = False
+
+    def status(self, session_id: str):
+        return {"enabled": self.owner == session_id and not self.releasing,
+                "occupied": self.owner is not None or self.releasing}
+
+    def command_busy(self):
+        return self.command_switching or (
+            self.command_task is not None and not self.command_task.done())
+
+    def claim(self, session_id: str):
+        if self.releasing or self.owner not in (None, session_id):
+            raise RuntimeError("Another session owns manual control")
+        if self.command_busy():
+            raise RuntimeError("Wait for the pending flight command before taking control")
+        bridge.require_fresh()
+        self.owner = session_id
+        self.last_heartbeat = time.monotonic()
+
+    async def release(self, session_id: str, reason: str, failsafe: bool):
+        if self.owner != session_id or self.releasing:
+            return
+        self.releasing = True
+        try:
+            if self.command_session == session_id and self.command_busy():
+                self.command_task.cancel()
+                await asyncio.gather(self.command_task, return_exceptions=True)
+            try:
+                if failsafe and bridge.snapshot()["telemetry"].get("armed"):
+                    bridge.rtl()
+                    bridge.log(f"{reason}: RTL requested", "WARN")
+                elif not failsafe:
+                    bridge.manual_control(0, 0, 500, 0)
+            except Exception as exc:
+                bridge.log(f"{reason}: control release action failed: {exc}", "WARN")
+        finally:
+            self.owner = None
+            self.releasing = False
+
+
+control = ControlCoordinator()
+
+
+async def send_session(ws: WebSocket, session: Dict[str, Any], payload: dict):
+    # Telemetry, command results and authentication share the same socket.
+    async with session["send_lock"]:
+        async with asyncio.timeout(2.0):
+            await ws.send_json(payload)
+
+
+async def wait_command(command: int, sent_at: float, mode: Optional[str] = None):
+    """An ACK accepts a request; mode changes require a new confirming heartbeat."""
+    deadline = time.monotonic() + COMMAND_TIMEOUT_S
+    while time.monotonic() < deadline:
+        with bridge.state_lock:
+            acks = list(bridge.command_acks)
+            mode_confirmed = (
+                mode is not None and bridge.state["mode"] == mode
+                and bridge.message_times.get("HEARTBEAT", 0) >= sent_at
+            )
+        for received, ack in acks:
+            if received < sent_at or ack["command"] != command:
+                continue
+            result = ack["result"]
+            if result not in (mavutil.mavlink.MAV_RESULT_ACCEPTED,
+                              mavutil.mavlink.MAV_RESULT_IN_PROGRESS):
+                raise RuntimeError(f"Flight controller rejected command (MAV_RESULT={result})")
+            if result == mavutil.mavlink.MAV_RESULT_ACCEPTED and mode is None:
+                return "Flight controller accepted the request (completion not implied)"
+        if mode_confirmed and bridge.is_fresh("HEARTBEAT"):
+            return f"Flight controller confirmed {mode} mode"
+        await asyncio.sleep(0.05)
+    raise TimeoutError("No final acknowledgment/mode confirmation; outcome unknown, not retried")
+
+
+async def confirmed_mode(mode: str):
+    sent_at = time.monotonic()
+    bridge.set_mode(mode)
+    return await wait_command(mavutil.mavlink.MAV_CMD_DO_SET_MODE, sent_at, mode)
+
+
+async def execute_flight_command(data: dict):
+    if data["type"] == "set_mode":
+        return await confirmed_mode(str(data.get("mode", "")).upper())
+    cmd = str(data.get("command", "")).upper()
+    if cmd in ("RTL", "LAND"):
+        return await confirmed_mode(cmd)
+    if cmd == "EMERGENCY_STOP":
+        sent_at = time.monotonic()
+        action = bridge.emergency_stop()
+        command = (mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM if action == "disarm"
+                   else mavutil.mavlink.MAV_CMD_DO_SET_MODE)
+        return await wait_command(command, sent_at, None if action == "disarm" else "LAND")
+    if cmd == "TAKEOFF":
+        altitude = float(data.get("altitude_m", TAKEOFF_ALT_M))
+        if not math.isfinite(altitude) or altitude <= 0:
+            raise ValueError("Takeoff altitude must be a finite positive number")
+        bridge.require_preflight()
+        if not bridge.snapshot()["telemetry"].get("armed"):
+            raise RuntimeError("TAKEOFF blocked: vehicle is not armed")
+        await confirmed_mode("GUIDED")
+        sent_at = time.monotonic()
+        bridge.takeoff(altitude)
+        return await wait_command(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, sent_at)
+    if cmd in ("ARM", "DISARM"):
+        sent_at = time.monotonic()
+        (bridge.arm if cmd == "ARM" else bridge.disarm)()
+        return await wait_command(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, sent_at)
+    raise ValueError(f"Unknown command: {cmd}")
+
+
+async def run_flight_command(ws: WebSocket, session: dict, data: dict):
+    result = {"type": "command_status", "request_id": data["request_id"]}
+    try:
+        await send_session(ws, session, {**result, "status": "pending", "message": "Waiting for flight controller"})
+        message = await execute_flight_command(data)
+        status = "accepted"
+    except asyncio.CancelledError:
+        # Cancellation must stop any later stage (especially GUIDED -> TAKEOFF).
+        # If the socket is still open, report the uncertain outcome.
+        try:
+            await send_session(ws, session, {**result, "status": "timeout", "message": "Control session ended; outcome unknown"})
+        except Exception:
+            pass
+        raise
+    except TimeoutError as exc:
+        status, message = "timeout", str(exc)
+    except Exception as exc:
+        status, message = "rejected", str(exc)
+    await send_session(ws, session, {**result, "status": status, "message": message})
 
 
 class CameraService:
@@ -588,15 +773,18 @@ async def startup_event():
     bridge.start()
     camera.start()
     app.state.telemetry_logger = asyncio.create_task(telemetry_logger_loop())
+    app.state.sync_poller = asyncio.create_task(sync_status_loop())
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     bridge.stop()
     camera.stop()
-    task = getattr(app.state, "telemetry_logger", None)
-    if task:
-        task.cancel()
+    for name in ("telemetry_logger", "sync_poller"):
+        task = getattr(app.state, name, None)
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 @app.get("/")
@@ -608,7 +796,7 @@ def index():
 def health():
     return {
         "ok": True,
-        "mavlink_connected": bridge.connected,
+        "mavlink_connected": bridge.snapshot()["mavlink_connected"],
         "camera_source": camera.source,
         "sync": sync_status(),
     }
@@ -654,89 +842,119 @@ def video_feed():
 async def telemetry_logger_loop():
     while True:
         try:
-            snapshot = bridge.snapshot()["telemetry"]
-            snapshot["mavlink_connected"] = bridge.connected
-            store.add_telemetry(snapshot)
+            current = bridge.snapshot()
+            snapshot = current["telemetry"]
+            snapshot["mavlink_connected"] = current["mavlink_connected"]
+            await asyncio.to_thread(store.add_telemetry, snapshot)
         except Exception as exc:
             bridge.log(f"Telemetry store error: {exc}", "WARN")
         await asyncio.sleep(1.0)
 
 
-async def ws_sender(ws: WebSocket):
+async def sync_status_loop():
+    while True:
+        try:
+            app.state.sync_status = await asyncio.to_thread(sync_status)
+        except Exception as exc:
+            bridge.log(f"Sync status error: {exc}", "WARN")
+        await asyncio.sleep(5)
+
+
+async def ws_sender(ws: WebSocket, session: Dict[str, Any]):
     while True:
         snap = bridge.snapshot()
-        snap["sync"] = sync_status()
-        await ws.send_json(snap)
+        snap["sync"] = getattr(app.state, "sync_status", {})
+        snap["control"] = control.status(session["id"])
+        await send_session(ws, session, snap)
         await asyncio.sleep(0.25)
 
 
 async def ws_receiver(ws: WebSocket, session: Dict[str, Any]):
     while True:
-        data = await ws.receive_json()
-        msg_type = str(data.get("type", ""))
-
-        if not session["authenticated"]:
-            if msg_type != "auth" or data.get("token") != CONTROL_TOKEN:
-                await ws.send_json({"type": "error", "message": "Authentication required"})
+        data = None
+        try:
+            data = await ws.receive_json()
+            if not isinstance(data, dict):
+                raise ValueError("Expected a JSON object")
+            msg_type = str(data.get("type", ""))
+            if not session["authenticated"]:
+                if msg_type != "auth" or data.get("token") != CONTROL_TOKEN:
+                    await send_session(ws, session, {"type": "auth_failed", "message": "Invalid control token"})
+                    continue
+                session["authenticated"] = True
+                await send_session(ws, session, {"type": "auth_ok", "command_timeout_s": 2 * COMMAND_TIMEOUT_S + 5})
                 continue
-            session["authenticated"] = True
-            session["last_operator_heartbeat"] = time.monotonic()
-            await ws.send_json({"type": "auth_ok"})
-            continue
 
-        if msg_type == "operator_heartbeat":
-            session["last_operator_heartbeat"] = time.monotonic()
-
-        elif msg_type == "take_control":
-            session["control_taken"] = bool(data.get("enabled", False))
-            session["last_operator_heartbeat"] = time.monotonic()
-            await ws.send_json({"type": "control_lease", "enabled": session["control_taken"]})
-
-        elif msg_type == "manual":
-            if not session["control_taken"]:
-                await ws.send_json({"type": "error", "message": "Manual control lease is not enabled"})
-                continue
-            session["last_operator_heartbeat"] = time.monotonic()
-            bridge.manual_control(data.get("x", 0), data.get("y", 0), data.get("z", 500), data.get("r", 0))
-
-        elif msg_type == "set_mode":
-            bridge.set_mode(str(data.get("mode", "")))
-
-        elif msg_type == "command":
-            cmd = str(data.get("command", "")).upper()
-            if cmd == "ARM":
-                bridge.arm()
-            elif cmd == "DISARM":
-                bridge.disarm()
-            elif cmd == "TAKEOFF":
-                bridge.takeoff(float(data.get("altitude_m", TAKEOFF_ALT_M)))
-            elif cmd == "RTL":
-                bridge.rtl()
-            elif cmd == "LAND":
-                bridge.land()
-            elif cmd == "EMERGENCY_STOP":
-                result = bridge.emergency_stop()
-                await ws.send_json({"type": "emergency_action", "action": result})
+            if msg_type == "operator_heartbeat":
+                if control.owner == session["id"]:
+                    control.last_heartbeat = time.monotonic()
+            elif msg_type == "take_control":
+                if not isinstance(data.get("enabled"), bool):
+                    raise ValueError("enabled must be a boolean")
+                if data["enabled"]:
+                    control.claim(session["id"])
+                else:
+                    await control.release(session["id"], "Manual control disabled", failsafe=False)
+                await send_session(ws, session, {"type": "control_lease", **control.status(session["id"])})
+            elif msg_type == "manual":
+                if not control.status(session["id"])["enabled"]:
+                    raise RuntimeError("This session does not own manual control")
+                bridge.manual_control(data.get("x", 0), data.get("y", 0),
+                                      data.get("z", 500), data.get("r", 0))
+                control.last_heartbeat = time.monotonic()
+            elif msg_type in ("command", "set_mode"):
+                request_id = data.get("request_id")
+                if not isinstance(request_id, str) or not 1 <= len(request_id) <= 100:
+                    raise ValueError("A request_id of 1..100 characters is required")
+                if request_id in session["request_ids"]:
+                    raise ValueError("Duplicate command request; not resent")
+                session["request_ids"].append(request_id)
+                if control.releasing or control.owner not in (None, session["id"]):
+                    raise RuntimeError("Another session owns manual control")
+                if control.command_switching:
+                    raise RuntimeError("An emergency command is being prepared")
+                if control.command_busy():
+                    if msg_type != "command" or data.get("command") != "EMERGENCY_STOP":
+                        raise RuntimeError("A flight command is already pending")
+                    # Emergency LAND/disarm must not wait behind an ACK timeout.
+                    control.command_switching = True
+                    try:
+                        control.command_task.cancel()
+                        await asyncio.gather(control.command_task, return_exceptions=True)
+                    finally:
+                        control.command_switching = False
+                control.command_session = session["id"]
+                task = asyncio.create_task(run_flight_command(ws, session, data))
+                control.command_task = task
+                session["command_task"] = task
+                # Retrieve transport exceptions even if the connection closes first.
+                task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
             else:
-                raise RuntimeError(f"Unknown command: {cmd}")
-
-        else:
-            await ws.send_json({"type": "error", "message": f"Unknown message type: {msg_type}"})
+                raise ValueError(f"Unknown message type: {msg_type}")
+        except WebSocketDisconnect:
+            raise
+        except Exception as exc:
+            # A rejected or malformed command must not tear down the connection.
+            payload = {"type": "error", "message": str(exc)}
+            if isinstance(data, dict):
+                if data.get("type") in ("command", "set_mode"):
+                    payload.update(type="command_status", request_id=data.get("request_id"), status="rejected")
+                if data.get("type") in ("take_control", "manual"):
+                    if data.get("type") == "manual":
+                        await control.release(session["id"], "Manual input rejected", failsafe=True)
+                    await send_session(ws, session, {"type": "control_lease", **control.status(session["id"])})
+            await send_session(ws, session, payload)
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-    session = {
-        "authenticated": False,
-        "control_taken": False,
-        "last_operator_heartbeat": time.monotonic(),
-    }
+    session = {"id": uuid4().hex, "authenticated": False,
+               "send_lock": asyncio.Lock(), "command_task": None,
+               "request_ids": deque(maxlen=100)}
     bridge.log("UI WebSocket connected")
-
-    sender = asyncio.create_task(ws_sender(ws))
+    sender = asyncio.create_task(ws_sender(ws, session))
     receiver = asyncio.create_task(ws_receiver(ws, session))
-
     try:
         while True:
             done, _ = await asyncio.wait(
@@ -744,39 +962,27 @@ async def websocket_endpoint(ws: WebSocket):
             )
             if done:
                 for task in done:
-                    exc = task.exception()
-                    if exc:
-                        raise exc
+                    task.result()
                 break
-
-            if (
-                session["authenticated"]
-                and session["control_taken"]
-                and bridge.snapshot()["telemetry"].get("armed")
-                and time.monotonic() - session["last_operator_heartbeat"] > CONTROL_LINK_TIMEOUT_S
-            ):
-                session["control_taken"] = False
-                try:
-                    bridge.rtl()
-                    bridge.log("Operator-link timeout while manually controlled: RTL requested", "WARN")
-                except Exception as exc:
-                    bridge.log(f"Operator-link timeout RTL failed: {exc}", "WARN")
-
+            if (control.owner == session["id"] and
+                    (time.monotonic() - control.last_heartbeat > CONTROL_LINK_TIMEOUT_S
+                     or not bridge.is_fresh("HEARTBEAT"))):
+                await control.release(session["id"], "Operator/telemetry link timeout", failsafe=True)
+                await send_session(ws, session, {"type": "control_lease", **control.status(session["id"])})
     except (WebSocketDisconnect, asyncio.CancelledError):
         pass
     except Exception as exc:
-        try:
-            await ws.send_json({"type": "error", "message": str(exc)})
-        except Exception:
-            pass
         bridge.log(f"UI WebSocket error: {exc}", "WARN")
     finally:
         sender.cancel()
         receiver.cancel()
-        if session.get("control_taken") and bridge.snapshot()["telemetry"].get("armed"):
-            try:
-                bridge.rtl()
-                bridge.log("Control UI disconnected while manually controlled: RTL requested", "WARN")
-            except Exception as exc:
-                bridge.log(f"Disconnect RTL failed: {exc}", "WARN")
+        command_task = session["command_task"]
+        if command_task and not command_task.done():
+            command_task.cancel()
+        await asyncio.gather(sender, receiver, *([command_task] if command_task else []), return_exceptions=True)
+        await control.release(session["id"], "Control UI disconnected", failsafe=True)
+        try:
+            await ws.close()
+        except Exception:
+            pass
         bridge.log("UI WebSocket disconnected")

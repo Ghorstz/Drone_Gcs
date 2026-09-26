@@ -117,7 +117,23 @@ button.secondary {
   gap: 8px;
   align-items: center;
   min-width: 0;
+  flex-wrap: wrap;
 }
+
+.connection-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex-basis: 100%;
+  grid-column: 1 / -1;
+}
+
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+.command-status { overflow-wrap: anywhere; }
+.command-status[data-status="pending"] { color: var(--warn); }
+.command-status[data-status="accepted"] { color: var(--accent); }
+.command-status[data-status="rejected"],
+.command-status[data-status="timeout"] { color: #ffc0c4; }
 
 .token-input {
   width: 170px;

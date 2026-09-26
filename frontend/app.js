@@ -6,6 +6,17 @@ let reconnectTimer = null;
 let manualEnabled = false;
 let controlState = { x: 0, y: 0, z: 500, r: 0 };
 let lastTelemetry = null;
+let mavlinkConnected = false;
+let controlOccupied = false;
+let leasePending = false;
+let leaseTimer = null;
+let reconnectAttempt = 0;
+let lastMessageAt = 0;
+let commandTimeoutMs = 25000;
+let pendingCommand = null;
+let commandSequence = 0;
+const stickResets = [];
+const localLogs = [];
 
 const track = [];
 const mapState = {
@@ -21,87 +32,177 @@ function token() {
   return localStorage.getItem("purayControlToken") || $("tokenInput").value.trim();
 }
 
-function setLinkBadge(ok, text) {
-  const el = $("linkBadge");
+function setBadge(id, ok, text) {
+  const el = $(id);
   el.textContent = text;
   el.className = `badge ${ok ? "ok" : "bad"}`;
 }
 
+function updateControls() {
+  const ready = authenticated && mavlinkConnected && ws?.readyState === WebSocket.OPEN;
+  const blocked = controlOccupied && !manualEnabled;
+  $("manualToggle").disabled = !ready || blocked || leasePending ||
+    (Boolean(pendingCommand) && !manualEnabled);
+  for (const button of document.querySelectorAll("[data-command], #setModeBtn")) {
+    button.disabled = !ready || blocked ||
+      (Boolean(pendingCommand) && button.dataset.command !== "EMERGENCY_STOP");
+  }
+}
+
+function resetManual() {
+  manualEnabled = false;
+  $("manualToggle").checked = false;
+  controlState = { x: 0, y: 0, z: 500, r: 0 };
+  for (const reset of stickResets) reset();
+}
+
+function renderControl(control) {
+  controlOccupied = Boolean(control.occupied);
+  const owned = authenticated && mavlinkConnected && !document.hidden &&
+    !leasePending && Boolean(control.enabled);
+  if (!owned) resetManual();
+  manualEnabled = owned;
+  $("manualToggle").checked = owned;
+  setBadge("controlBadge", owned, leasePending ? "CONTROL: REQUEST PENDING" : owned ? "CONTROL: YOU" :
+    controlOccupied ? "CONTROL: OTHER SESSION" : "CONTROL: AVAILABLE");
+  updateControls();
+}
+
+function commandFeedback(status, message, label = pendingCommand?.label || "Command") {
+  const el = $("commandStatus");
+  el.dataset.status = status;
+  el.textContent = `${label}: ${status.toUpperCase()} - ${message}`;
+}
+
+function finishCommand(status, message) {
+  if (!pendingCommand) return;
+  commandFeedback(status, message);
+  clearTimeout(pendingCommand.timer);
+  pendingCommand = null;
+  updateControls();
+}
+
+function resetConnection() {
+  authenticated = false;
+  mavlinkConnected = false;
+  controlOccupied = false;
+  leasePending = false;
+  clearTimeout(leaseTimer);
+  lastTelemetry = null;
+  resetManual();
+  finishCommand("timeout", "Connection ended; outcome unknown. Command was not retried.");
+  setBadge("authBadge", false, "AUTH: NOT AUTHENTICATED");
+  setBadge("linkBadge", false, "MAVLINK: UNKNOWN");
+  setBadge("controlBadge", false, "CONTROL: UNKNOWN");
+  updateControls();
+}
+
 function connectWebSocket() {
   clearTimeout(reconnectTimer);
-
-  if (ws) {
-    try {
-      ws.close();
-    } catch (_) {}
-  }
-
+  const oldSocket = ws;
+  ws = null; // Invalidate the old callbacks before closing that socket.
+  if (oldSocket) oldSocket.close();
+  resetConnection();
+  setBadge("backendBadge", false, "BACKEND: CONNECTING");
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  ws = new WebSocket(`${proto}//${location.host}/ws`);
+  const socket = new WebSocket(`${proto}//${location.host}/ws`);
+  ws = socket;
+  lastMessageAt = Date.now();
 
-  ws.onopen = () => {
-    authenticated = false;
-    setLinkBadge(false, "AUTHENTICATING");
-
-    ws.send(
-      JSON.stringify({
-        type: "auth",
-        token: token()
-      })
-    );
+  socket.onopen = () => {
+    if (ws !== socket) return;
+    setBadge("backendBadge", true, "BACKEND: CONNECTED");
+    setBadge("authBadge", false, "AUTH: AUTHENTICATING");
+    socket.send(JSON.stringify({ type: "auth", token: token() }));
   };
 
-  ws.onmessage = (ev) => {
-    const msg = JSON.parse(ev.data);
-
+  socket.onmessage = (ev) => {
+    if (ws !== socket) return;
+    lastMessageAt = Date.now();
+    reconnectAttempt = 0;
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (_) { return; }
     if (msg.type === "auth_ok") {
       authenticated = true;
-      setLinkBadge(true, "UI CONNECTED");
-      return;
-    }
-
-    if (msg.type === "error") {
+      commandTimeoutMs = (msg.command_timeout_s || 25) * 1000;
+      setBadge("authBadge", true, "AUTH: AUTHENTICATED");
+      updateControls();
+    } else if (msg.type === "auth_failed") {
+      authenticated = false;
+      resetManual();
+      setBadge("authBadge", false, "AUTH: REJECTED");
+      updateControls();
       addLocalLog("WARN", msg.message);
-      return;
-    }
-
-    if (msg.type === "telemetry") {
+    } else if (msg.type === "control_lease") {
+      leasePending = false;
+      clearTimeout(leaseTimer);
+      renderControl(msg);
+    } else if (msg.type === "command_status") {
+      if (!pendingCommand || msg.request_id !== pendingCommand.id) return;
+      if (msg.status === "pending") commandFeedback(msg.status, msg.message);
+      else finishCommand(msg.status, msg.message);
+    } else if (msg.type === "error") {
+      addLocalLog("WARN", msg.message);
+    } else if (msg.type === "telemetry") {
       lastTelemetry = msg;
       renderTelemetry(msg);
-      return;
-    }
-
-    if (msg.type === "emergency_action") {
+      renderControl(msg.control || {});
+    } else if (msg.type === "emergency_action") {
       addLocalLog("WARN", `Emergency action: ${msg.action}`);
     }
   };
 
-  ws.onclose = () => {
-    authenticated = false;
-    setLinkBadge(false, "UI DISCONNECTED");
-
-    reconnectTimer = setTimeout(connectWebSocket, 1500);
+  socket.onclose = () => {
+    if (ws !== socket) return;
+    ws = null;
+    resetConnection();
+    setBadge("backendBadge", false, "BACKEND: DISCONNECTED");
+    const delay = Math.min(10000, 1000 * 2 ** reconnectAttempt++);
+    reconnectTimer = setTimeout(() => {
+      if (ws === null) connectWebSocket();
+    }, delay);
   };
-
-  ws.onerror = () => {
-    ws.close();
+  socket.onerror = () => {
+    if (ws === socket) socket.close();
   };
+  updateControls();
 }
 
+// Detect half-open connections as well as explicit close events.
+setInterval(() => {
+  if (ws && Date.now() - lastMessageAt > 10000) ws.close();
+}, 1000);
+
 function send(obj) {
-  if (
-    !ws ||
-    ws.readyState !== WebSocket.OPEN ||
-    !authenticated
-  ) {
-    addLocalLog(
-      "WARN",
-      "Control message not sent: UI WebSocket is not authenticated"
-    );
+  if (!ws || ws.readyState !== WebSocket.OPEN || !authenticated) {
+    addLocalLog("WARN", "Control message not sent: backend is not authenticated");
+    return false;
+  }
+  try {
+    ws.send(JSON.stringify(obj));
+    return true;
+  } catch (_) {
+    ws.close();
+    return false;
+  }
+}
+
+function sendCommand(obj) {
+  if (pendingCommand) {
+    if (obj.command !== "EMERGENCY_STOP") return;
+    finishCommand("timeout", "Superseded by emergency request; outcome unknown");
+  }
+  const id = `${Date.now()}-${++commandSequence}`;
+  pendingCommand = { id, label: obj.command || `SET MODE ${obj.mode}`, timer: null };
+  commandFeedback("pending", "Sending request");
+  if (!send({ ...obj, request_id: id })) {
+    finishCommand("rejected", "Request was not sent");
     return;
   }
-
-  ws.send(JSON.stringify(obj));
+  pendingCommand.timer = setTimeout(() => {
+    if (pendingCommand?.id === id) finishCommand("timeout", "No result received; outcome unknown. Not retried.");
+  }, commandTimeoutMs);
+  updateControls();
 }
 
 function fmt(v, suffix = "") {
@@ -113,12 +214,10 @@ function fmt(v, suffix = "") {
 function renderTelemetry(msg) {
   const t = msg.telemetry || {};
 
-  setLinkBadge(
-    Boolean(msg.mavlink_connected),
-    msg.mavlink_connected
-      ? "MAVLINK ONLINE"
-      : "MAVLINK OFFLINE"
-  );
+  mavlinkConnected = Boolean(msg.mavlink_connected);
+  setBadge("linkBadge", mavlinkConnected,
+    mavlinkConnected ? "MAVLINK: ONLINE" : "MAVLINK: OFFLINE / STALE");
+  updateControls();
 
   $("batteryVal").textContent = fmt(t.battery_pct, "%");
   $("gpsVal").textContent = fmt(t.gps_sats);
@@ -255,7 +354,8 @@ function renderAnalytics(data) {
 function renderLogs(logs) {
   const host = $("systemLog");
 
-  host.innerHTML = logs
+  host.innerHTML = [...logs, ...localLogs]
+    .sort((a, b) => (a.ts || "").localeCompare(b.ts || ""))
     .slice(-30)
     .map((item) => {
       const time =
@@ -277,18 +377,9 @@ function renderLogs(logs) {
 }
 
 function addLocalLog(level, message) {
-  const host = $("systemLog");
-
-  const el = document.createElement("div");
-
-  el.className = `log-line ${level}`;
-
-  el.textContent =
-    `[local] ${level}: ${message}`;
-
-  host.appendChild(el);
-
-  host.scrollTop = host.scrollHeight;
+  localLogs.push({ ts: new Date().toISOString(), level, message: `[local] ${message}` });
+  if (localLogs.length > 30) localLogs.shift();
+  renderLogs(lastTelemetry?.logs || []);
 }
 
 function escapeHtml(s) {
@@ -316,6 +407,7 @@ function createStick(
   let activePointer = null;
 
   function update(clientX, clientY) {
+    if (!manualEnabled) return;
     const r =
       element.getBoundingClientRect();
 
@@ -358,6 +450,7 @@ function createStick(
   element.addEventListener(
     "pointerdown",
     (e) => {
+      if (!manualEnabled) return;
       activePointer =
         e.pointerId;
 
@@ -409,6 +502,15 @@ function createStick(
       false
     );
   }
+
+  stickResets.push(() => {
+    const pointer = activePointer;
+    activePointer = null;
+    if (pointer !== null && element.hasPointerCapture(pointer)) {
+      element.releasePointerCapture(pointer);
+    }
+    knob.style.transform = "translate(-50%,-50%)";
+  });
 
   element.addEventListener(
     "pointerup",
@@ -470,27 +572,27 @@ setInterval(() => {
   }
 }, 500);
 
-$("manualToggle").addEventListener(
-  "change",
-  (e) => {
-    manualEnabled =
-      e.target.checked;
-
-    send({
-      type: "take_control",
-      enabled: manualEnabled
-    });
-
-    if (!manualEnabled) {
-      controlState = {
-        x: 0,
-        y: 0,
-        z: 500,
-        r: 0
-      };
-    }
+function requestManual(enabled) {
+  resetManual();
+  leasePending = true;
+  if (!send({ type: "take_control", enabled })) leasePending = false;
+  clearTimeout(leaseTimer);
+  if (leasePending) {
+    leaseTimer = setTimeout(() => {
+      // An unanswered ownership request is uncertain: reconnect with no lease.
+      if (leasePending) connectWebSocket();
+    }, 5000);
   }
-);
+  updateControls();
+}
+
+$("manualToggle").addEventListener("change", (e) => {
+  requestManual(e.target.checked);
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && (manualEnabled || leasePending)) requestManual(false);
+});
 
 for (
   const btn of
@@ -515,7 +617,7 @@ for (
         if (!ok) return;
       }
 
-      send({
+      sendCommand({
         type: "command",
         command: command
       });
@@ -526,7 +628,7 @@ for (
 $("setModeBtn").addEventListener(
   "click",
   () => {
-    send({
+    sendCommand({
       type: "set_mode",
       mode:
         $("modeSelect").value

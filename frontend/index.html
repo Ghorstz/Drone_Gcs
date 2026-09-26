@@ -17,7 +17,12 @@
       <div class="subtitle">Autonomous Upland Plant Monitoring</div>
     </div>
     <div class="header-actions">
-      <span id="linkBadge" class="badge bad">MAVLINK OFFLINE</span>
+      <div class="connection-status" role="status" aria-live="polite">
+        <span id="backendBadge" class="badge bad">BACKEND: DISCONNECTED</span>
+        <span id="authBadge" class="badge bad">AUTH: NOT AUTHENTICATED</span>
+        <span id="linkBadge" class="badge bad">MAVLINK: UNKNOWN</span>
+        <span id="controlBadge" class="badge bad">CONTROL: UNKNOWN</span>
+      </div>
       <input id="tokenInput" class="token-input" type="password" placeholder="Control token" />
       <button id="saveTokenBtn" class="secondary">CONNECT</button>
     </div>
@@ -81,6 +86,7 @@
         <button data-command="DISARM" class="secondary">DISARM</button>
         <button data-command="EMERGENCY_STOP" class="danger">EMERGENCY STOP</button>
       </div>
+      <p id="commandStatus" class="safety-note command-status" role="status" aria-live="polite">No command sent.</p>
       <label class="manual-toggle">
         <input id="manualToggle" type="checkbox" />
         Enable manual joystick control
