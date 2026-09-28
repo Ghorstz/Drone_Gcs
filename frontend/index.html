@@ -2,56 +2,101 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width,
-             initial-scale=1.0,
-             maximum-scale=1.0,
-             viewport-fit=cover" />
-  <meta name="theme-color" content="#0b1116" />
-  <title>Puray Drone GCS</title>
-  <link rel="stylesheet" href="/static/styles.css" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#08131d" />
+  <title>AgriDrone | Puray Ground Control</title>
+  <link rel="stylesheet" href="/static/styles.css?v=dashboard-3" />
 </head>
-<body>
+<body data-view="home" data-stick-mode="attitude">
+<svg xmlns="http://www.w3.org/2000/svg" class="icon-sprite" aria-hidden="true"><defs><symbol id="i-home" viewBox="0 0 24 24"><path d="M3 10 12 3l9 7v11h-6v-7H9v7H3Z"/></symbol><symbol id="i-map" viewBox="0 0 24 24"><path d="m3 5 6-2 6 2 6-2v16l-6 2-6-2-6 2Zm6-2v16m6-14v16"/></symbol><symbol id="i-logs" viewBox="0 0 24 24"><path d="M6 3h9l4 4v14H6Zm9 0v5h4M9 12h7m-7 4h7"/></symbol><symbol id="i-settings" viewBox="0 0 24 24"><path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8Zm0-6v3m0 14v3M2 12h3m14 0h3M5 5l2 2m10 10 2 2M5 19l2-2M17 7l2-2"/></symbol><symbol id="i-camera" viewBox="0 0 24 24"><path d="M3 7h5l2-3h4l2 3h5v13H3Zm9 3a4 4 0 1 0 0 8 4 4 0 0 0 0-8Z"/></symbol><symbol id="i-control" viewBox="0 0 24 24"><path d="M6 7h12l3 11-4 1-3-4h-4l-3 4-4-1ZM8 9v5m-3-2h6m5-2h1m1 3h1"/></symbol><symbol id="i-leaf" viewBox="0 0 24 24"><path d="M20 3C8 2 2 8 5 16c7 5 15-2 15-13ZM4 21 16 7"/></symbol><symbol id="i-expand" viewBox="0 0 24 24"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/></symbol><symbol id="i-arrow" viewBox="0 0 24 24"><path d="M12 20V4m-6 6 6-6 6 6"/></symbol><symbol id="i-pin" viewBox="0 0 24 24"><path d="M12 21s7-7 7-12a7 7 0 0 0-14 0c0 5 7 12 7 12Zm0-15a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z"/></symbol><symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol><symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></symbol><symbol id="i-land" viewBox="0 0 24 24"><path d="M12 4v13m-6-6 6 6 6-6M5 21h14"/></symbol></defs></svg>
   <header class="topbar">
-    <div>
-      <div class="title">PURAY DRONE GCS</div>
-      <div class="subtitle">Autonomous Upland Plant Monitoring</div>
+    <button id="mobileMenuBtn" class="icon-button mobile-menu" aria-label="Open navigation" aria-expanded="false"><svg class="icon" aria-hidden="true"><use href="#i-menu"></use></svg></button>
+    <a class="brand" href="#home" data-view-target="home"><svg class="icon" aria-hidden="true"><use href="#i-leaf"></use></svg><span><strong>AgriDrone</strong><small>Puray &middot; Plant Monitoring</small></span></a>
+    <div class="header-readouts">
+      <button id="connectionSummary" class="connection-summary" data-view-target="settings"><i class="status-dot"></i><span id="connectionText">Offline</span></button>
+      <span class="header-stat"><sv g class="icon" aria-hidden="true"><use href="#i-pin"></use></svg> GPS <b id="headerGps">--</b></span>
+      <span class="header-stat battery-stat">BAT <b id="headerBattery">--</b></span>
+      <time id="headerClock"></time>
     </div>
-    <div class="header-actions">
-      <div class="connection-status" role="status" aria-live="polite">
-        <span id="backendBadge" class="badge bad">BACKEND: DISCONNECTED</span>
-        <span id="authBadge" class="badge bad">AUTH: NOT AUTHENTICATED</span>
-        <span id="linkBadge" class="badge bad">MAVLINK: UNKNOWN</span>
-        <span id="controlBadge" class="badge bad">CONTROL: UNKNOWN</span>
-      </div>
-      <input id="tokenInput" class="token-input" type="password" placeholder="Control token" />
-      <button id="saveTokenBtn" class="secondary">CONNECT</button>
-    </div>
+    <button class="icon-button settings-shortcut" data-view-target="settings" aria-label="Connection settings"><svg class="icon" aria-hidden="true"><use href="#i-settings"></use></svg></button>
   </header>
-
-  <main class="layout">
-    <section class="panel camera-panel">
-      <div class="panel-title">REAL-TIME CAMERA / EDGE AI</div>
-      <div class="camera-wrap">
-        <img id="cameraFeed" src="/video_feed" alt="Live camera" />
-        <div class="camera-overlay">
-          <span id="modeOverlay">MODE: --</span>
-          <span id="gpsOverlay">GPS: --</span>
-          <span id="batteryOverlay">BAT: --</span>
+  <div class="app-shell">
+    <nav class="sidebar" aria-label="Main navigation"><button class="nav-item active" data-view-target="home" aria-label="Dashboard"><svg class="icon" aria-hidden="true"><use href="#i-home"></use></svg><span>Dashboard</span></button><button class="nav-item " data-view-target="live" aria-label="Live view"><svg class="icon" aria-hidden="true"><use href="#i-camera"></use></svg><span>Live view</span></button><button class="nav-item " data-view-target="map" aria-label="GPS map"><svg class="icon" aria-hidden="true"><use href="#i-map"></use></svg><span>GPS map</span></button><button class="nav-item " data-view-target="health" aria-label="Crop health"><svg class="icon" aria-hidden="true"><use href="#i-leaf"></use></svg><span>Crop health</span></button><button class="nav-item " data-view-target="controls" aria-label="Flight control"><svg class="icon" aria-hidden="true"><use href="#i-control"></use></svg><span>Flight control</span></button><button class="nav-item " data-view-target="logs" aria-label="Logs"><svg class="icon" aria-hidden="true"><use href="#i-logs"></use></svg><span>Logs</span></button><button class="nav-item " data-view-target="settings" aria-label="Settings"><svg class="icon" aria-hidden="true"><use href="#i-settings"></use></svg><span>Settings</span></button><div class="sidebar-caption">PURAY FIELD STATION<small>Ground control system</small></div></nav>
+    <main class="layout">
+      <div class="flight-column">
+        <section class="panel camera-panel">
+          <div class="camera-wrap" id="cameraStage">
+            <div id="cameraPlaceholder" class="camera-placeholder"><svg class="icon" aria-hidden="true"><use href="#i-camera"></use></svg><strong>Drone camera</strong><span>Waiting for the live feed</span></div>
+            <img id="cameraFeed" src="/video_feed" alt="Live drone camera" />
+            <span id="cameraStatus" class="live-label"><i></i> CAMERA</span>
+            <button id="fullscreenBtn" class="icon-button expand-button" aria-label="Expand camera"><svg class="icon" aria-hidden="true"><use href="#i-expand"></use></svg></button>
+            <div class="camera-overlay">
+              <span id="modeOverlay">MODE: --</span>
+              <span>ALT: <b id="altOverlay">--</b></span>
+              <span>SPD: <b id="speedOverlay">--</b></span>
+              <span id="gpsOverlay">GPS: --</span>
+              <span id="batteryOverlay">BAT: --</span>
+            </div>
+          </div>
+          <div class="camera-tools">
+            <button id="captureBtn" disabled><svg class="icon" aria-hidden="true"><use href="#i-camera"></use></svg><span>Photo</span></button>
+            <button disabled title="Video recording is not available yet"><i class="record-dot"></i><span>Record <small>Soon</small></span></button>
+            <button data-view-target="health"><svg class="icon" aria-hidden="true"><use href="#i-leaf"></use></svg><span>Crop health</span></button>
+          </div>
+          <p id="cameraNotice" class="camera-notice" role="status"></p>
+        </section>
+        <section class="panel map-panel">
+          <div class="panel-title"><span><svg class="icon" aria-hidden="true"><use href="#i-map"></use></svg> GPS MAP</span><small>Offline track</small></div>
+          <div class="map-stage">
+            <canvas id="mapCanvas" aria-label="Drone GPS track"></canvas>
+            <div class="map-tools"><button id="mapZoomIn" aria-label="Zoom in">+</button><button id="mapZoomOut" aria-label="Zoom out">&minus;</button><button id="mapCenter" aria-label="Center track"><svg class="icon" aria-hidden="true"><use href="#i-pin"></use></svg></button></div>
+          </div>
+          <div class="map-readout"><span>Latitude <b id="latVal">--</b></span><span>Longitude <b id="lonVal">--</b></span><span>Altitude <b id="altVal">--</b></span><span>Speed <b id="speedVal">--</b></span></div>
+        </section>
+    <section class="panel actions-panel">
+      <div class="panel-title"><span><svg class="icon" aria-hidden="true"><use href="#i-control"></use></svg> FLIGHT CONTROLS</span><div class="control-mode-switch" role="group" aria-label="Flight control mode"><button id="manualModeBtn" type="button" aria-pressed="false">Manual</button><button id="autoModeBtn" type="button" aria-pressed="true">Auto</button></div></div>
+      <input id="manualToggle" class="visually-hidden" type="checkbox" aria-label="Enable manual joystick control" />
+      <div class="control-console">
+        <div class="joystick-controls">
+          <div class="stick-mode-switch" role="group" aria-label="Joystick axes"><button type="button" data-stick-mode="attitude" aria-pressed="true">Pitch / Roll</button><button type="button" data-stick-mode="throttle" aria-pressed="false">Throttle / Yaw</button></div>
+          <div class="sticks">
+            <div class="stick-control stick-control-throttle"><div id="leftStick" class="stick" role="slider" aria-label="Throttle and yaw joystick" aria-valuemin="-1000" aria-valuemax="1000" tabindex="0"><div class="knob"></div></div><small>Throttle / Yaw</small></div>
+            <div class="stick-control stick-control-attitude"><div id="rightStick" class="stick" role="slider" aria-label="Pitch and roll joystick" aria-valuemin="-1000" aria-valuemax="1000" tabindex="0"><div class="knob"></div><span class="stick-direction direction-up">Up</span><span class="stick-direction direction-right">Right</span><span class="stick-direction direction-down">Down</span><span class="stick-direction direction-left">Left</span></div><small>Pitch / Roll</small></div>
+          </div>
+        </div>
+        <div class="action-grid primary-actions">
+          <button data-command="TAKEOFF" class="primary"><svg class="icon" aria-hidden="true"><use href="#i-arrow"></use></svg><span>Takeoff</span></button>
+          <button data-command="RTL" class="warn"><svg class="icon" aria-hidden="true"><use href="#i-home"></use></svg><span>Return</span></button>
+          <button data-mode-command="LOITER" class="warn"><svg class="icon" aria-hidden="true"><use href="#i-pause"></use></svg><span>Hover</span></button>
+          <button data-command="LAND" class="danger"><svg class="icon" aria-hidden="true"><use href="#i-land"></use></svg><span>Land</span></button>
         </div>
       </div>
+      <details class="safety-controls"><summary>Arm &amp; safety controls</summary><div class="action-grid"><button data-command="ARM" class="good">ARM</button><button data-command="DISARM" class="secondary">DISARM</button><button data-command="EMERGENCY_STOP" class="danger">EMERGENCY STOP</button></div><p class="safety-note safety-explanation">Airborne emergency stop requests LAND; motor kill is blocked unless the vehicle reports on-ground.</p></details>
+      <p id="commandStatus" class="safety-note command-status" role="status" aria-live="polite">No command sent.</p>
     </section>
-
-    <section class="panel map-panel">
-      <div class="panel-title">LIVE GPS TRACK — OFFLINE SAFE</div>
-      <canvas id="mapCanvas"></canvas>
-      <div class="map-readout">
-        <span>LAT <b id="latVal">--</b></span>
-        <span>LON <b id="lonVal">--</b></span>
-        <span>ALT <b id="altVal">--</b></span>
-        <span>SPD <b id="speedVal">--</b></span>
       </div>
-    </section>
-
+      <div class="insights-column">
+        <section class="panel analytics-panel">
+          <div class="panel-title"><span><svg class="icon" aria-hidden="true"><use href="#i-leaf"></use></svg> CROP HEALTH</span><select id="cropSelect" aria-label="Select crop"><option value="okra">Okra</option><option value="talong">Talong</option><option value="sili">Sili</option></select></div>
+          <div id="analyticsCards" class="analytics-cards"></div>
+        </section>
+        <section class="panel detections-panel">
+          <div class="panel-title"><span>AI DETECTIONS</span><small>Not active</small></div>
+          <div class="detection-empty"><svg class="icon" aria-hidden="true"><use href="#i-leaf"></use></svg><strong>No detections yet</strong><p>Plant observations will appear here when crop analysis is connected.</p></div>
+        </section>
+        <section class="panel logs-panel">
+          <div class="panel-title"><span><svg class="icon" aria-hidden="true"><use href="#i-logs"></use></svg> SYSTEM LOG</span><small>Latest events</small></div>
+          <div id="systemLog" class="system-log"><p class="empty-log">Waiting for system events.</p></div>
+        </section>
+      </div>
+      <section class="panel settings-panel">
+        <div class="panel-title"><span><svg class="icon" aria-hidden="true"><use href="#i-settings"></use></svg> CONNECTION SETTINGS</span></div>
+        <p class="settings-intro">Connect to your ground station to enable flight controls.</p>
+        <div class="connection-status" role="status" aria-live="polite">
+          <span id="backendBadge" class="badge bad">BACKEND: DISCONNECTED</span><span id="authBadge" class="badge bad">AUTH: NOT AUTHENTICATED</span><span id="linkBadge" class="badge bad">MAVLINK: UNKNOWN</span><span id="controlBadge" class="badge bad">CONTROL: UNKNOWN</span>
+        </div>
+        <div class="header-actions"><label for="tokenInput">Control token</label><input id="tokenInput" class="token-input" type="password" placeholder="Enter control token" autocomplete="off" /><button id="saveTokenBtn" class="primary">Connect</button></div>
+      </section>
     <section class="panel telemetry-panel">
       <div class="panel-title">FLIGHT TELEMETRY</div>
       <div class="telemetry-grid">
@@ -75,58 +120,10 @@
         <button id="setModeBtn" class="secondary">SET MODE</button>
       </div>
     </section>
-
-    <section class="panel actions-panel">
-      <div class="panel-title">QUICK ACTIONS</div>
-      <div class="action-grid">
-        <button data-command="ARM" class="good">ARM</button>
-        <button data-command="TAKEOFF" class="primary">TAKEOFF</button>
-        <button data-command="RTL" class="warn">RTL</button>
-        <button data-command="LAND" class="warn">LAND</button>
-        <button data-command="DISARM" class="secondary">DISARM</button>
-        <button data-command="EMERGENCY_STOP" class="danger">EMERGENCY STOP</button>
-      </div>
-      <p id="commandStatus" class="safety-note command-status" role="status" aria-live="polite">No command sent.</p>
-      <label class="manual-toggle">
-        <input id="manualToggle" type="checkbox" />
-        Enable manual joystick control
-      </label>
-      <p class="safety-note">Airborne “Emergency Stop” requests LAND; motor kill is blocked unless the vehicle reports on-ground.</p>
-    </section>
-
-    <section class="panel joystick-panel">
-      <div class="panel-title">VIRTUAL JOYSTICKS</div>
-      <div class="sticks">
-        <div>
-          <div id="leftStick" class="stick"><div class="knob"></div></div>
-          <small>Throttle / Yaw</small>
-        </div>
-        <div>
-          <div id="rightStick" class="stick"><div class="knob"></div></div>
-          <small>Pitch / Roll</small>
-        </div>
-      </div>
-    </section>
-
-    <section class="panel analytics-panel">
-      <div class="panel-title">CROP HEALTH ANALYTICS</div>
-      <div id="analyticsCards" class="analytics-cards"></div>
-    </section>
-
-    <section class="panel logs-panel">
-      <div class="panel-title">SYSTEM LOG</div>
-      <div id="systemLog" class="system-log"></div>
-    </section>
-
-    <section id="syncPanel" class="panel sync-panel hidden">
-      <div>
-        <div class="panel-title">STORE-AND-FORWARD READY</div>
-        <div id="syncText">Home Wi-Fi detected. Unsynced flight data is available.</div>
-      </div>
-      <button id="syncBtn" class="primary">SYNC TO GOOGLE DRIVE</button>
-    </section>
-  </main>
-
-  <script src="/static/app.js"></script>
+      <section id="syncPanel" class="panel sync-panel hidden"><div><div class="panel-title">FLIGHT DATA SYNC</div><div id="syncText">Unsynced flight data is available.</div></div><button id="syncBtn" class="primary">Sync to Google Drive</button></section>
+    </main>
+  </div>
+  <nav class="bottom-nav" aria-label="Mobile navigation"><button class="nav-item active" data-view-target="home"><svg class="icon" aria-hidden="true"><use href="#i-home"></use></svg><span>Home</span></button><button class="nav-item " data-view-target="map"><svg class="icon" aria-hidden="true"><use href="#i-map"></use></svg><span>Map</span></button><button class="nav-item " data-view-target="logs"><svg class="icon" aria-hidden="true"><use href="#i-logs"></use></svg><span>Logs</span></button><button class="nav-item " data-view-target="settings"><svg class="icon" aria-hidden="true"><use href="#i-settings"></use></svg><span>Settings</span></button></nav>
+  <script src="/static/app.js?v=dashboard-1"></script>
 </body>
 </html>

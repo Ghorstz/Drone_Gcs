@@ -36,6 +36,14 @@ function setBadge(id, ok, text) {
   const el = $(id);
   el.textContent = text;
   el.className = `badge ${ok ? "ok" : "bad"}`;
+  const online = authenticated && mavlinkConnected;
+  $("connectionSummary").classList.toggle("online", online);
+  $("connectionText").textContent = online ? "Connected" :
+    ws?.readyState === WebSocket.OPEN ? "View only" : "Offline";
+  if (!mavlinkConnected) {
+    $("headerGps").textContent = "--";
+    $("headerBattery").textContent = "--";
+  }
 }
 
 function updateControls() {
@@ -43,7 +51,12 @@ function updateControls() {
   const blocked = controlOccupied && !manualEnabled;
   $("manualToggle").disabled = !ready || blocked || leasePending ||
     (Boolean(pendingCommand) && !manualEnabled);
-  for (const button of document.querySelectorAll("[data-command], #setModeBtn")) {
+  $("manualModeBtn").disabled = $("manualToggle").disabled;
+  $("manualModeBtn").classList.toggle("active", manualEnabled || leasePending);
+  $("manualModeBtn").setAttribute("aria-pressed", String(manualEnabled || leasePending));
+  $("autoModeBtn").classList.toggle("active", !manualEnabled && !leasePending);
+  $("autoModeBtn").setAttribute("aria-pressed", String(!manualEnabled && !leasePending));
+  for (const button of document.querySelectorAll("[data-command], [data-mode-command], #setModeBtn")) {
     button.disabled = !ready || blocked ||
       (Boolean(pendingCommand) && button.dataset.command !== "EMERGENCY_STOP");
   }
@@ -219,6 +232,10 @@ function renderTelemetry(msg) {
     mavlinkConnected ? "MAVLINK: ONLINE" : "MAVLINK: OFFLINE / STALE");
   updateControls();
 
+  $("headerGps").textContent = mavlinkConnected ? fmt(t.gps_sats) : "--";
+  $("headerBattery").textContent = mavlinkConnected ? fmt(t.battery_pct, "%") : "--";
+  $("altOverlay").textContent = fmt(t.relative_alt_m, " m");
+  $("speedOverlay").textContent = fmt(t.groundspeed_mps, " m/s");
   $("batteryVal").textContent = fmt(t.battery_pct, "%");
   $("gpsVal").textContent = fmt(t.gps_sats);
   $("modeVal").textContent = fmt(t.mode);
@@ -295,60 +312,41 @@ function renderSync(sync) {
 }
 
 function renderAnalytics(data) {
-  const host = $("analyticsCards");
-
-  const crops = [
-    "okra",
-    "talong",
-    "sili"
+  const crop = $("cropSelect").value;
+  const values = data[crop] || {};
+  const metrics = [
+    ["Healthy", "healthy", "#1bcd76"],
+    ["Wilting", "wilting", "#f6ce35"],
+    ["Disease", "disease", "#ff8b35"],
+    ["Pest", "pest", "#ff454b"]
   ];
-
-  host.innerHTML = crops
-    .map((crop) => {
-      const d = data[crop] || {};
-
-      const rows = [
-        ["Healthy", d.healthy],
-        ["Wilting", d.wilting],
-        ["Disease", d.disease],
-        ["Pest", d.pest]
-      ]
-        .map(([label, value]) => {
-          const pct =
-            typeof value === "number"
-              ? Math.max(
-                  0,
-                  Math.min(100, value)
-                )
-              : 0;
-
-          const text =
-            typeof value === "number"
-              ? `${value.toFixed(1)}%`
-              : "--";
-
-          return `
-            <div class="metric">
-              <span>${label}</span>
-
-              <div class="bar">
-                <i style="width:${pct}%"></i>
-              </div>
-
-              <b>${text}</b>
-            </div>
-          `;
-        })
-        .join("");
-
-      return `
-        <article class="crop-card">
-          <h3>${crop}</h3>
-          ${rows}
-        </article>
-      `;
-    })
-    .join("");
+  const valid = (value) => Number.isFinite(value) && value >= 0 && value <= 100;
+  const healthy = values.healthy;
+  const allValid = metrics.every(([, key]) => valid(values[key]));
+  const total = metrics.reduce((sum, [, key]) => sum + (valid(values[key]) ? values[key] : 0), 0);
+  // Only draw a distribution when all four percentages form a complete whole.
+  let background = "#20313c";
+  if (allValid && Math.abs(total - 100) < 0.5) {
+    let offset = 0;
+    const segments = metrics.map(([, key, color]) => {
+      const start = offset;
+      offset += values[key] / total * 100;
+      return `${color} ${start}% ${offset}%`;
+    });
+    background = `conic-gradient(${segments.join(",")})`;
+  } else if (valid(healthy)) {
+    background = `conic-gradient(#1bcd76 ${healthy}%, #20313c 0)`;
+  }
+  $("analyticsCards").innerHTML = `
+    <div class="health-summary">
+      <div class="health-ring" style="background:${background}">
+        <div class="health-ring-center"><strong>${valid(healthy) ? `${healthy.toFixed(0)}%` : "--"}</strong><small>${valid(healthy) ? "Healthy" : "No data"}</small></div>
+      </div>
+      <div class="health-legend">${metrics.map(([label, key, color]) => `
+        <div class="health-row"><i class="health-dot" style="background:${color}"></i><span>${label}</span><b>${valid(values[key]) ? `${values[key].toFixed(1)}%` : "--"}</b></div>
+      `).join("")}</div>
+    </div>
+    <p class="health-note">${allValid ? "Latest reported crop-health percentages." : "Waiting for crop-health analysis. No results available yet."}</p>`;
 }
 
 function renderLogs(logs) {
@@ -373,6 +371,7 @@ function renderLogs(logs) {
     })
     .join("");
 
+  if (!host.innerHTML.trim()) host.innerHTML = '<p class="empty-log">Waiting for system events.</p>';
   host.scrollTop = host.scrollHeight;
 }
 
@@ -590,6 +589,23 @@ $("manualToggle").addEventListener("change", (e) => {
   requestManual(e.target.checked);
 });
 
+$("manualModeBtn").addEventListener("click", () => {
+  if (!$("manualModeBtn").disabled) requestManual(true);
+});
+
+$("autoModeBtn").addEventListener("click", () => {
+  if (manualEnabled || leasePending) requestManual(false);
+});
+
+for (const button of document.querySelectorAll("[data-stick-mode]")) {
+  button.addEventListener("click", () => {
+    document.body.dataset.stickMode = button.dataset.stickMode;
+    for (const option of document.querySelectorAll("[data-stick-mode]")) {
+      option.setAttribute("aria-pressed", String(option === button));
+    }
+  });
+}
+
 document.addEventListener("visibilitychange", () => {
   if (document.hidden && (manualEnabled || leasePending)) requestManual(false);
 });
@@ -623,6 +639,12 @@ for (
       });
     }
   );
+}
+
+for (const button of document.querySelectorAll("[data-mode-command]")) {
+  button.addEventListener("click", () => {
+    sendCommand({ type: "set_mode", mode: button.dataset.modeCommand });
+  });
 }
 
 $("setModeBtn").addEventListener(
@@ -867,7 +889,7 @@ function drawMap() {
 
     ctx.fillText(
       "Waiting for GPS position…",
-      18,
+      60,
       28
     );
 
@@ -1062,6 +1084,91 @@ window.addEventListener(
   resizeMap
 );
 
-resizeMap();
+function showView(view) {
+  if (!["home", "live", "map", "health", "controls", "logs", "settings"].includes(view)) view = "home";
+  // Release the manual lease when navigating away from visible flight controls.
+  if (manualEnabled || leasePending) requestManual(false);
+  document.body.dataset.view = view;
+  for (const button of document.querySelectorAll("[data-view-target]")) {
+    const active = button.dataset.viewTarget === view;
+    button.classList.toggle("active", active);
+    if (active) button.setAttribute("aria-current", "page");
+    else button.removeAttribute("aria-current");
+  }
+  window.scrollTo({ top: 0, behavior: "instant" });
+  requestAnimationFrame(resizeMap);
+}
+for (const button of document.querySelectorAll("[data-view-target]")) {
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    showView(button.dataset.viewTarget);
+    document.body.classList.remove("nav-open");
+    $("mobileMenuBtn").setAttribute("aria-expanded", "false");
+    $("mobileMenuBtn").setAttribute("aria-label", "Open navigation");
+  });
+}
+$("mobileMenuBtn").addEventListener("click", () => {
+  const open = document.body.classList.toggle("nav-open");
+  $("mobileMenuBtn").setAttribute("aria-expanded", String(open));
+  $("mobileMenuBtn").setAttribute("aria-label", open ? "Close navigation" : "Open navigation");
+});
+document.addEventListener("click", (event) => {
+  if (document.body.classList.contains("nav-open") && event.target === document.body) {
+    document.body.classList.remove("nav-open");
+    $("mobileMenuBtn").setAttribute("aria-expanded", "false");
+    $("mobileMenuBtn").setAttribute("aria-label", "Open navigation");
+  }
+});
+$("cropSelect").addEventListener("change", () => renderAnalytics(lastTelemetry?.crop_health || {}));
+$("mapZoomIn").addEventListener("click", () => { mapState.zoom = Math.min(30, mapState.zoom * 1.3); drawMap(); });
+$("mapZoomOut").addEventListener("click", () => { mapState.zoom = Math.max(0.1, mapState.zoom / 1.3); drawMap(); });
+$("mapCenter").addEventListener("click", () => {
+  const latest = track.length ? project(track[track.length - 1], track[0]) : { x: 0, y: 0 };
+  mapState.panX = -latest.x * 2 * mapState.zoom;
+  mapState.panY = -latest.y * 2 * mapState.zoom;
+  drawMap();
+});
 
+const cameraFeed = $("cameraFeed");
+function cameraAvailability(available) {
+  $("cameraStage").classList.toggle("has-frame", available);
+  $("captureBtn").disabled = !available;
+  $("cameraStatus").innerHTML = `<i></i> ${available ? "LIVE" : "OFFLINE"}`;
+}
+cameraFeed.addEventListener("load", () => cameraAvailability(true));
+cameraFeed.addEventListener("error", () => cameraAvailability(false));
+// MJPEG streams may not fire load until the stream ends; check decoded frames.
+setInterval(() => cameraAvailability(cameraFeed.naturalWidth > 0), 1000);
+$("fullscreenBtn").addEventListener("click", async () => {
+  try {
+    if (document.fullscreenElement) await document.exitFullscreen();
+    else if ($("cameraStage").requestFullscreen) await $("cameraStage").requestFullscreen();
+    else $("cameraNotice").textContent = "Fullscreen is unavailable in this browser.";
+  } catch (_) { $("cameraNotice").textContent = "Unable to open fullscreen."; }
+});
+$("captureBtn").addEventListener("click", () => {
+  if (!cameraFeed.naturalWidth) return;
+  const photo = document.createElement("canvas");
+  photo.width = cameraFeed.naturalWidth;
+  photo.height = cameraFeed.naturalHeight;
+  photo.getContext("2d").drawImage(cameraFeed, 0, 0);
+  photo.toBlob((blob) => {
+    if (!blob) return;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `puray-capture-${Date.now()}.jpg`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    $("cameraNotice").textContent = "Photo download requested.";
+  }, "image/jpeg", 0.92);
+});
+function updateClock() {
+  $("headerClock").textContent = new Date().toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+updateClock();
+setInterval(updateClock, 30000);
+renderAnalytics({});
+if (typeof ResizeObserver !== "undefined") new ResizeObserver(resizeMap).observe(canvas);
+resizeMap();
 connectWebSocket();
