@@ -54,8 +54,8 @@ function updateControls() {
   $("manualModeBtn").disabled = $("manualToggle").disabled;
   $("manualModeBtn").classList.toggle("active", manualEnabled || leasePending);
   $("manualModeBtn").setAttribute("aria-pressed", String(manualEnabled || leasePending));
-  $("autoModeBtn").classList.toggle("active", !manualEnabled && !leasePending);
-  $("autoModeBtn").setAttribute("aria-pressed", String(!manualEnabled && !leasePending));
+  $("manualOffBtn").classList.toggle("active", !manualEnabled && !leasePending);
+  $("manualOffBtn").setAttribute("aria-pressed", String(!manualEnabled && !leasePending));
   for (const button of document.querySelectorAll("[data-command], [data-mode-command], #setModeBtn")) {
     button.disabled = !ready || blocked ||
       (Boolean(pendingCommand) && button.dataset.command !== "EMERGENCY_STOP");
@@ -593,14 +593,15 @@ $("manualModeBtn").addEventListener("click", () => {
   if (!$("manualModeBtn").disabled) requestManual(true);
 });
 
-$("autoModeBtn").addEventListener("click", () => {
+$("manualOffBtn").addEventListener("click", () => {
   if (manualEnabled || leasePending) requestManual(false);
 });
 
-for (const button of document.querySelectorAll("[data-stick-mode]")) {
+const stickModeButtons = document.querySelectorAll(".stick-mode-switch button[data-stick-mode]");
+for (const button of stickModeButtons) {
   button.addEventListener("click", () => {
     document.body.dataset.stickMode = button.dataset.stickMode;
-    for (const option of document.querySelectorAll("[data-stick-mode]")) {
+    for (const option of stickModeButtons) {
       option.setAttribute("aria-pressed", String(option === button));
     }
   });
