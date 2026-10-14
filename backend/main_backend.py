@@ -39,6 +39,8 @@ DB_PATH = DATA_DIR / "drone.db"
 
 MAVLINK_CONNECTION = os.getenv("MAVLINK_CONNECTION", "/dev/serial0")
 MAVLINK_BAUD = int(os.getenv("MAVLINK_BAUD", "115200"))
+FC_PROTOCOL = os.getenv("FC_PROTOCOL", "mavlink").strip().lower()  # "mavlink" (default) or "inav"
+INAV_PORT = os.getenv("INAV_PORT", "/dev/ttyACM0")
 CONTROL_TOKEN = os.getenv("CONTROL_TOKEN", "dev-only-change-me")
 HOME_SSID = os.getenv("HOME_SSID", "")
 CONTROL_LINK_TIMEOUT_S = float(os.getenv("CONTROL_LINK_TIMEOUT_S", "2.0"))
@@ -453,7 +455,18 @@ class MavlinkBridge:
             self.log(f"{crop.upper()} alert: disease={disease:.1f}% pest={pest:.1f}%", "ALERT")
 
 
-bridge = MavlinkBridge()
+if FC_PROTOCOL == "inav":
+    try:
+        from backend.inav_bridge import InavBridge
+    except ImportError:
+        from inav_bridge import InavBridge
+    bridge = InavBridge(
+        port=INAV_PORT,
+        max_age_s=TELEMETRY_MAX_AGE_S,
+        log_sink=lambda level, message: store.add_log(level, message),
+    )
+else:
+    bridge = MavlinkBridge()
 
 
 class ControlCoordinator:
@@ -484,6 +497,8 @@ class ControlCoordinator:
         if self.command_busy():
             raise RuntimeError("Wait for the pending flight command before taking control")
         bridge.require_fresh()
+        if FC_PROTOCOL != "mavlink":
+            raise RuntimeError("Manual control is not available on INAV yet")
         self.owner = session_id
         self.last_heartbeat = time.monotonic()
 
