@@ -29,3 +29,28 @@ runs/
 # OS files
 .DS_Store
 Thumbs.db
+# Backup files
+*.bak
+*.backup
+*.bak.*
+*.backup.*
+
+# Tokens and local secrets
+.env.bak*
+*.token
+
+# Runtime logs
+gps_log*.csv
+perf_log.csv
+gps_run.txt
+
+# Temporary image test folders
+plant_test/
+nonplant_test/
+
+# Temporary Python cache
+.pytest_cache/
+
+# Temporary development and patch scripts
+patch_*.py
+insert_*.py

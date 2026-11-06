@@ -60,7 +60,7 @@
         <div class="joystick-controls">
           <div class="stick-mode-switch" role="group" aria-label="Joystick axes"><button type="button" data-stick-mode="attitude" aria-pressed="true">Pitch / Roll</button><button type="button" data-stick-mode="throttle" aria-pressed="false">Throttle / Yaw</button></div>
           <div class="sticks">
-            <div class="stick-control stick-control-throttle"><div id="leftStick" class="stick" role="slider" aria-label="Throttle and yaw joystick" aria-valuemin="-1000" aria-valuemax="1000" tabindex="0"><div class="knob"></div></div><small>Throttle / Yaw</small></div>
+            <div class="stick-control stick-control-throttle"><div id="leftStick" class="stick" role="slider" aria-label="Throttle and yaw joystick" aria-valuemin="-1000" aria-valuemax="1000" tabindex="0"><div class="knob"></div></div><small>Throttle / Yaw</small><span id="throttleHoldLabel" style="display:block;font-weight:bold">Throttle hold: 0%</span><button type="button" id="throttleCutBtn" style="display:block;margin-top:6px;padding:10px 14px;background:#b00020;color:#fff;font-weight:bold;border:0;border-radius:6px">THROTTLE CUT</button></div>
             <div class="stick-control stick-control-attitude"><div id="rightStick" class="stick" role="slider" aria-label="Pitch and roll joystick" aria-valuemin="-1000" aria-valuemax="1000" tabindex="0"><div class="knob"></div><span class="stick-direction direction-up">Up</span><span class="stick-direction direction-right">Right</span><span class="stick-direction direction-down">Down</span><span class="stick-direction direction-left">Left</span></div><small>Pitch / Roll</small></div>
           </div>
         </div>

@@ -1,0 +1,4 @@
+INFO: Created TensorFlow Lite XNNPACK delegate for CPU.
+anthracnos_sample.jpg: mean=74.9 ms max=75.9 ms top=Chilli__Anthracnos conf=1.00
+healthy_sample.jpg: mean=74.9 ms max=75.9 ms top=Chilli___healthy conf=0.97
+whitefly_sample.jpg: mean=75.0 ms max=83.6 ms top=Chilli __Whitefly conf=0.90

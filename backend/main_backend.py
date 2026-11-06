@@ -42,6 +42,22 @@ MAVLINK_BAUD = int(os.getenv("MAVLINK_BAUD", "115200"))
 FC_PROTOCOL = os.getenv("FC_PROTOCOL", "mavlink").strip().lower()  # "mavlink" (default) or "inav"
 INAV_PORT = os.getenv("INAV_PORT", "/dev/ttyACM0")
 CONTROL_TOKEN = os.getenv("CONTROL_TOKEN", "dev-only-change-me")
+
+import hmac as _hmac
+_DEFAULT_TOKEN = "dev-only-change-me"
+if CONTROL_TOKEN == _DEFAULT_TOKEN or len(CONTROL_TOKEN) < 16:
+    raise RuntimeError(
+        "CONTROL_TOKEN is missing, is the default value, or is shorter than "
+        "16 characters. Refusing to start. Set a strong CONTROL_TOKEN in .env."
+    )
+
+
+def _token_ok(candidate) -> bool:
+    if not isinstance(candidate, str):
+        return False
+    return _hmac.compare_digest(candidate.encode("utf-8"), CONTROL_TOKEN.encode("utf-8"))
+
+
 HOME_SSID = os.getenv("HOME_SSID", "")
 CONTROL_LINK_TIMEOUT_S = float(os.getenv("CONTROL_LINK_TIMEOUT_S", "2.0"))
 TAKEOFF_ALT_M = float(os.getenv("TAKEOFF_ALT_M", "5.0"))
@@ -468,6 +484,30 @@ if FC_PROTOCOL == "inav":
 else:
     bridge = MavlinkBridge()
 
+try:
+    from backend.crop_classifier import ChiliClassifier
+except ImportError:
+    from crop_classifier import ChiliClassifier
+
+chili_classifier = ChiliClassifier(
+    bridge=bridge,
+    log_sink=lambda level, message: store.add_log(level, message),
+)
+
+
+def normalized_to_inav_pwm(x: int, y: int, z: int, r: int):
+    """x=pitch-stick, y=roll-stick (frontend convention, both -1000..1000),
+    z=throttle (0..1000), r=yaw-stick (-1000..1000)
+    -> (roll, pitch, throttle, yaw) raw PWM for InavBridge.manual_control().
+    Verified standalone via test_normalized_to_pwm.py (6/6 PASS, MSP_RC readback)."""
+    def _clamp(v, lo, hi):
+        return max(lo, min(hi, v))
+    roll = _clamp(1500 + int(y) * 0.5, 1000, 2000)
+    pitch = _clamp(1500 + int(x) * 0.5, 1000, 2000)
+    throttle = _clamp(1000 + int(z) * 1.0, 1000, 1350)  # backend cap, matches UI 35%
+    yaw = _clamp(1500 + int(r) * 0.5, 1000, 2000)
+    return int(roll), int(pitch), int(throttle), int(yaw)
+
 
 class ControlCoordinator:
     """Process-wide ownership; accessed only by the ASGI event loop.
@@ -497,8 +537,6 @@ class ControlCoordinator:
         if self.command_busy():
             raise RuntimeError("Wait for the pending flight command before taking control")
         bridge.require_fresh()
-        if FC_PROTOCOL != "mavlink":
-            raise RuntimeError("Manual control is not available on INAV yet")
         self.owner = session_id
         self.last_heartbeat = time.monotonic()
 
@@ -511,11 +549,21 @@ class ControlCoordinator:
                 self.command_task.cancel()
                 await asyncio.gather(self.command_task, return_exceptions=True)
             try:
-                if failsafe and bridge.snapshot()["telemetry"].get("armed"):
+                if failsafe and FC_PROTOCOL == "inav":
+                    if bridge.snapshot()["telemetry"].get("armed") is False:
+                        bridge.manual_control(roll=1500, pitch=1500, throttle=1000, yaw=1500)
+                        bridge.log(f"{reason}: disarmed, safe idle sent", "WARN")
+                    else:
+                        bridge.pause_rc(reason)
+                elif failsafe and bridge.snapshot()["telemetry"].get("armed"):
                     bridge.rtl()
                     bridge.log(f"{reason}: RTL requested", "WARN")
                 elif not failsafe:
-                    bridge.manual_control(0, 0, 500, 0)
+                    if FC_PROTOCOL == "inav":
+                        bridge.manual_control(roll=1500, pitch=1500, throttle=1000, yaw=1500)
+                        bridge.log("[DEBUG] release: roll=1500 pitch=1500 throttle=1000 yaw=1500 (safe-idle sent)")
+                    else:
+                        bridge.manual_control(0, 0, 500, 0)
             except Exception as exc:
                 bridge.log(f"{reason}: control release action failed: {exc}", "WARN")
         finally:
@@ -558,6 +606,21 @@ async def wait_command(command: int, sent_at: float, mode: Optional[str] = None)
     raise TimeoutError("No final acknowledgment/mode confirmation; outcome unknown, not retried")
 
 
+async def wait_inav_armed(expect_armed: bool, timeout_s: float = COMMAND_TIMEOUT_S):
+    """INAV-specific ARM/DISARM confirmation: polls the FC's real armingFlags
+    via MSP2_INAV_STATUS (InavBridge.is_armed()) instead of a MAVLink ACK.
+    Verified mechanism: test_get_arming_flags.py, test_real_arm_cycle.py
+    (real hardware, this session). Runs the blocking MSP call in a thread
+    so the websocket event loop is never blocked."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        armed = await asyncio.to_thread(bridge.is_armed)
+        if armed is not None and armed == expect_armed:
+            return f"Flight controller confirmed {'ARMED' if expect_armed else 'DISARMED'}"
+        await asyncio.sleep(0.1)
+    raise TimeoutError("No arming-state confirmation from flight controller; outcome unknown, not retried")
+
+
 async def confirmed_mode(mode: str):
     sent_at = time.monotonic()
     bridge.set_mode(mode)
@@ -590,6 +653,15 @@ async def execute_flight_command(data: dict):
     if cmd in ("ARM", "DISARM"):
         sent_at = time.monotonic()
         (bridge.arm if cmd == "ARM" else bridge.disarm)()
+        if FC_PROTOCOL == "inav":
+            try:
+                return await wait_inav_armed(expect_armed=(cmd == "ARM"))
+            except TimeoutError:
+                if cmd == "ARM":
+                    bridge.disarm()  # un-latch AUX1 so a late-clearing blocker cannot arm the FC
+                    armf = await asyncio.to_thread(bridge.get_arming_flags)
+                    bridge.log("ARM timed out; AUX1 reverted to 1000. FC armingFlags=" + ("unreadable" if armf is None else f"0x{armf:08x}"), "WARN")
+                raise
         return await wait_command(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, sent_at)
     raise ValueError(f"Unknown command: {cmd}")
 
@@ -786,15 +858,21 @@ app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 @app.on_event("startup")
 async def startup_event():
     bridge.start()
+    if FC_PROTOCOL == "inav":
+        bridge.start_rc_override()
     camera.start()
+    chili_classifier.start(camera)
     app.state.telemetry_logger = asyncio.create_task(telemetry_logger_loop())
     app.state.sync_poller = asyncio.create_task(sync_status_loop())
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    if FC_PROTOCOL == "inav":
+        bridge.stop_rc_override()
     bridge.stop()
     camera.stop()
+    chili_classifier.stop()
     for name in ("telemetry_logger", "sync_poller"):
         task = getattr(app.state, name, None)
         if task:
@@ -824,7 +902,7 @@ def api_sync_status():
 
 @app.post("/api/sync")
 def api_sync(x_control_token: str = Header(default="")):
-    if x_control_token != CONTROL_TOKEN:
+    if not _token_ok(x_control_token):
         raise HTTPException(status_code=401, detail="Invalid control token")
     status = sync_status()
     if not status["on_home_wifi"]:
@@ -877,6 +955,9 @@ async def sync_status_loop():
 
 async def ws_sender(ws: WebSocket, session: Dict[str, Any]):
     while True:
+        if not session["authenticated"]:
+            await asyncio.sleep(0.25)
+            continue
         snap = bridge.snapshot()
         snap["sync"] = getattr(app.state, "sync_status", {})
         snap["control"] = control.status(session["id"])
@@ -893,7 +974,7 @@ async def ws_receiver(ws: WebSocket, session: Dict[str, Any]):
                 raise ValueError("Expected a JSON object")
             msg_type = str(data.get("type", ""))
             if not session["authenticated"]:
-                if msg_type != "auth" or data.get("token") != CONTROL_TOKEN:
+                if msg_type != "auth" or not _token_ok(data.get("token")):
                     await send_session(ws, session, {"type": "auth_failed", "message": "Invalid control token"})
                     continue
                 session["authenticated"] = True
@@ -914,8 +995,16 @@ async def ws_receiver(ws: WebSocket, session: Dict[str, Any]):
             elif msg_type == "manual":
                 if not control.status(session["id"])["enabled"]:
                     raise RuntimeError("This session does not own manual control")
-                bridge.manual_control(data.get("x", 0), data.get("y", 0),
-                                      data.get("z", 500), data.get("r", 0))
+                if FC_PROTOCOL == "inav":
+                    _roll, _pitch, _throttle, _yaw = normalized_to_inav_pwm(
+                        data.get("x", 0), data.get("y", 0),
+                        data.get("z", 500), data.get("r", 0))
+                    bridge.manual_control(roll=_roll, pitch=_pitch,
+                                          throttle=_throttle, yaw=_yaw)
+                    bridge.log(f"[DEBUG] manual: roll={_roll} pitch={_pitch} throttle={_throttle} yaw={_yaw}")
+                else:
+                    bridge.manual_control(data.get("x", 0), data.get("y", 0),
+                                          data.get("z", 500), data.get("r", 0))
                 control.last_heartbeat = time.monotonic()
             elif msg_type in ("command", "set_mode"):
                 request_id = data.get("request_id")

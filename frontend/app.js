@@ -4,8 +4,12 @@ let ws = null;
 let authenticated = false;
 let reconnectTimer = null;
 let manualEnabled = false;
-let controlState = { x: 0, y: 0, z: 500, r: 0 };
+let controlState = { x: 0, y: 0, z: 0, r: 0 };
+let throttleHold = 0;
+let leftNy = 0;
 let lastTelemetry = null;
+let currentProtocol = "unknown";
+let protocolNoticeShown = false;
 let mavlinkConnected = false;
 let controlOccupied = false;
 let leasePending = false;
@@ -48,8 +52,18 @@ function setBadge(id, ok, text) {
 
 function updateControls() {
   const ready = authenticated && mavlinkConnected && ws?.readyState === WebSocket.OPEN;
+  const protocolSupportsControl = currentProtocol === "mavlink" || currentProtocol === "inav_msp";
   const blocked = controlOccupied && !manualEnabled;
+  if (protocolSupportsControl) {
+    protocolNoticeShown = false;
+  } else if (currentProtocol !== "unknown" && !protocolNoticeShown && !pendingCommand) {
+    const statusEl = $("commandStatus");
+    statusEl.dataset.status = "info";
+    statusEl.textContent = `Flight controls unavailable: protocol "${currentProtocol}" does not support commands yet.`;
+    protocolNoticeShown = true;
+  }
   $("manualToggle").disabled = !ready || blocked || leasePending ||
+    !protocolSupportsControl ||
     (Boolean(pendingCommand) && !manualEnabled);
   $("manualModeBtn").disabled = $("manualToggle").disabled;
   $("manualModeBtn").classList.toggle("active", manualEnabled || leasePending);
@@ -58,14 +72,29 @@ function updateControls() {
   $("autoModeBtn").setAttribute("aria-pressed", String(!manualEnabled && !leasePending));
   for (const button of document.querySelectorAll("[data-command], [data-mode-command], #setModeBtn")) {
     button.disabled = !ready || blocked ||
+      !protocolSupportsControl ||
       (Boolean(pendingCommand) && button.dataset.command !== "EMERGENCY_STOP");
   }
+  // Not implemented for INAV yet: disable and label honestly.
+  const stubSel = '[data-command="TAKEOFF"], [data-command="RTL"], [data-command="LAND"], [data-mode-command], #setModeBtn';
+  for (const button of document.querySelectorAll(stubSel)) {
+    button.disabled = true;
+    button.title = "Not available in this build";
+    const label = button.querySelector("span");
+    if (label && !label.dataset.orig) {
+      label.dataset.orig = label.textContent;
+      label.textContent = label.dataset.orig + " (n/a)";
+    }
+  }
+  $("modeSelect").disabled = true;
 }
 
 function resetManual() {
   manualEnabled = false;
   $("manualToggle").checked = false;
-  controlState = { x: 0, y: 0, z: 500, r: 0 };
+  controlState = { x: 0, y: 0, z: 0, r: 0 };
+  throttleHold = 0;
+  leftNy = 0;
   for (const reset of stickResets) reset();
 }
 
@@ -227,28 +256,27 @@ function fmt(v, suffix = "") {
 function renderTelemetry(msg) {
   const t = msg.telemetry || {};
 
+  currentProtocol = msg.protocol || "unknown";
+
   mavlinkConnected = Boolean(msg.mavlink_connected);
   setBadge("linkBadge", mavlinkConnected,
     mavlinkConnected ? "MAVLINK: ONLINE" : "MAVLINK: OFFLINE / STALE");
   updateControls();
 
   $("headerGps").textContent = mavlinkConnected ? fmt(t.gps_sats) : "--";
-  $("headerBattery").textContent = mavlinkConnected ? fmt(t.battery_pct, "%") : "--";
-  $("altOverlay").textContent = fmt(t.relative_alt_m, " m");
+  $("headerBattery").textContent = mavlinkConnected ? fmt(t.voltage_v, " V") : "--";
+  $("altOverlay").textContent = t.alt_m == null ? "--" : `${t.alt_m.toFixed(1)} m (GPS)`;
   $("speedOverlay").textContent = fmt(t.groundspeed_mps, " m/s");
-  $("batteryVal").textContent = fmt(t.battery_pct, "%");
+  $("batteryVal").textContent = fmt(t.voltage_v, " V");
   $("gpsVal").textContent = fmt(t.gps_sats);
   $("modeVal").textContent = fmt(t.mode);
-  $("armedVal").textContent = t.armed ? "YES" : "NO";
+  $("armedVal").textContent = t.armed === true ? "YES" : t.armed === false ? "NO" : "UNKNOWN";
   $("voltageVal").textContent = fmt(t.voltage_v, " V");
-  $("headingVal").textContent = fmt(t.heading_deg, "°");
+  $("headingVal").textContent = t.yaw_deg == null ? "--" : `${(((t.yaw_deg % 360) + 360) % 360).toFixed(0)}°`;
 
   $("modeOverlay").textContent = `MODE: ${fmt(t.mode)}`;
   $("gpsOverlay").textContent = `GPS: ${fmt(t.gps_sats)}`;
-  $("batteryOverlay").textContent = `BAT: ${fmt(
-    t.battery_pct,
-    "%"
-  )}`;
+  $("batteryOverlay").textContent = `BAT: ${fmt(t.voltage_v, " V")}`;
 
   $("latVal").textContent =
     t.lat == null ? "--" : t.lat.toFixed(6);
@@ -256,10 +284,7 @@ function renderTelemetry(msg) {
   $("lonVal").textContent =
     t.lon == null ? "--" : t.lon.toFixed(6);
 
-  $("altVal").textContent = fmt(
-    t.relative_alt_m,
-    " m"
-  );
+  $("altVal").textContent = t.alt_m == null ? "--" : `${t.alt_m.toFixed(1)} m (GPS)`;
 
   $("speedVal").textContent = fmt(
     t.groundspeed_mps,
@@ -533,13 +558,7 @@ createStick(
     controlState.r =
       Math.round(nx * 1000);
 
-    controlState.z =
-      active
-        ? Math.round(
-            ((1 - ny) / 2) *
-              1000
-          )
-        : 500;
+    leftNy = active ? ny : 0;
   }
 );
 
@@ -553,6 +572,51 @@ createStick(
       Math.round(-ny * 1000);
   }
 );
+
+// ---- Held throttle: push stick up/down to change, release to HOLD ----
+const THROTTLE_HOLD_MAX = 350;      // cap on 0..1000 scale for first tests
+const THROTTLE_RATE_PER_S = 200;    // units per second at full deflection
+const THROTTLE_DEADZONE = 0.12;
+let lastThrottleTick = performance.now();
+
+function renderThrottleLabel() {
+  const el = document.getElementById("throttleHoldLabel");
+  if (el) el.textContent = "Throttle hold: " + Math.round(throttleHold / 10) + "%";
+}
+function throttleCut() {
+  throttleHold = 0;
+  controlState.z = 0;
+  renderThrottleLabel();
+}
+const cutBtn = document.getElementById("throttleCutBtn");
+if (cutBtn) {
+  cutBtn.addEventListener("pointerdown", throttleCut);
+  cutBtn.addEventListener("click", throttleCut);
+}
+document.addEventListener("click", (e) => {
+  const b = e.target.closest && e.target.closest("[data-command]");
+  if (!b) return;
+  const c = String(b.dataset.command || "").toUpperCase();
+  if (c.includes("DISARM") || c === "EMERGENCY_STOP") throttleCut();
+}, true);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) throttleCut();
+});
+setInterval(() => {
+  const now = performance.now();
+  const dt = Math.min((now - lastThrottleTick) / 1000, 0.2);
+  lastThrottleTick = now;
+  if (!manualEnabled || document.hidden) {
+    throttleHold = 0;
+  } else if (Math.abs(leftNy) > THROTTLE_DEADZONE) {
+    const up = -leftNy;
+    const scaled = (Math.abs(up) - THROTTLE_DEADZONE) / (1 - THROTTLE_DEADZONE);
+    throttleHold += Math.sign(up) * scaled * THROTTLE_RATE_PER_S * dt;
+  }
+  throttleHold = Math.max(0, Math.min(THROTTLE_HOLD_MAX, throttleHold));
+  controlState.z = Math.round(throttleHold);
+  renderThrottleLabel();
+}, 50);
 
 setInterval(() => {
   if (manualEnabled) {

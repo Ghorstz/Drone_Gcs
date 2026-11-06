@@ -18,6 +18,8 @@ MSP_FC_VERSION = 3
 MSP_RAW_GPS = 106
 MSP_ATTITUDE = 108
 MSP_ANALOG = 110
+MSP_SET_RAW_RC = 200
+MSP2_INAV_STATUS = 0x2000
 
 # INAV raw fix (0 none, 1 2D, 2 3D) -> MAVLink-style fix_type used by the old code.
 # ASSUMPTION: to be verified outdoors with a real fix.
@@ -52,6 +54,18 @@ class InavBridge:
         self.command_acks = deque(maxlen=100)
         self._next_gps = 0.0
         self._next_analog = 0.0
+        self._next_arm = 0.0
+
+        # --- RC override state (Tier 2 control) ---
+        # 8 channels: Roll, Pitch, Throttle, Yaw, AUX1(ARM), AUX2, AUX3, AUX4
+        # SAFE DEFAULTS: throttle at minimum, AUX1 (arm) LOW = disarmed.
+        self.rc_lock = threading.Lock()
+        # Channel order confirmed via MSP_RC readback test: Roll, Pitch, YAW, THROTTLE
+        # (standard MSP wire order), NOT Roll, Pitch, Throttle, Yaw as first assumed.
+        self.rc_channels = [1500, 1500, 1000, 1500, 1000, 1000, 1000, 1000]
+        self.rc_enabled = False
+        self.rc_thread: Optional[threading.Thread] = None
+        self.rc_paused = False
 
         # None / "UNKNOWN" means unavailable (never invented).
         self.state: Dict[str, Any] = {
@@ -104,6 +118,46 @@ class InavBridge:
     def stop(self):
         self.stop_event.set()
 
+    def start_rc_override(self):
+        """Begin continuously streaming RC channels to the FC (Tier 2 control).
+        Must be called only after the telemetry thread is connected."""
+        if self.rc_thread and self.rc_thread.is_alive():
+            return
+        self.rc_enabled = True
+        self.rc_thread = threading.Thread(target=self._rc_run, daemon=True, name="inav-msp-rc")
+        self.rc_thread.start()
+        self.log("RC override stream started")
+
+    def pause_rc(self, reason: str = ""):
+        """Stop sending RC packets so the FC raises RC link loss and runs its own
+        failsafe. Resumes at safe idle when the FC reports disarmed, or on DISARM."""
+        if not self.rc_paused:
+            self.rc_paused = True
+            self.log(f"RC stream paused ({reason}); FC failsafe expected", "WARN")
+
+    def stop_rc_override(self):
+        """Stop streaming RC channels. Sets channels to safe/disarmed before stopping
+        so the last value the FC saw is always safe."""
+        with self.rc_lock:
+            self.rc_channels = [1500, 1500, 1000, 1500, 1000, 1000, 1000, 1000]
+        time.sleep(0.1)  # let one more safe packet go out before the thread exits
+        self.rc_enabled = False
+        self.log("RC override stream stopped")
+
+    def _rc_run(self):
+        """Continuously sends current rc_channels at ~20Hz. Required because INAV
+        treats a stalled MSP RC stream as a lost link and triggers failsafe."""
+        while self.rc_enabled and not self.stop_event.is_set():
+            try:
+                if self.ser is not None and not self.rc_paused:
+                    with self.rc_lock:
+                        chans = list(self.rc_channels)
+                    payload = struct.pack("<8H", *chans)
+                    self._msp_send(MSP_SET_RAW_RC, payload, timeout=0.2)
+            except Exception as exc:
+                self.log(f"RC override send error: {exc}", "WARN")
+            time.sleep(0.05)  # ~20Hz
+
     # ---------- serial / MSP ----------
     def _close(self):
         try:
@@ -152,6 +206,113 @@ class InavBridge:
                         return payload
             return None
 
+    def _msp_send(self, cmd: int, payload: bytes = b"", timeout: float = 0.5) -> bool:
+        """Send an MSP command with a payload (e.g. SET_RAW_RC) and wait for an ack.
+        Kept separate from _msp_request (read-only, zero-payload) to avoid touching
+        verified telemetry code."""
+        ser = self.ser
+        if ser is None:
+            raise serial.SerialException("serial port is not open")
+        size = len(payload)
+        checksum = size ^ cmd
+        for b in payload:
+            checksum ^= b
+        packet = bytes([0x24, 0x4D, 0x3C, size, cmd]) + payload + bytes([checksum])
+        with self.write_lock:
+            ser.reset_input_buffer()
+            ser.write(packet)
+            deadline = time.monotonic() + timeout
+            buf = bytearray()
+            while time.monotonic() < deadline:
+                buf += ser.read(ser.in_waiting or 1)
+                while True:
+                    i = buf.find(b"$M")
+                    if i < 0:
+                        if len(buf) > 64:
+                            del buf[:-1]
+                        break
+                    if len(buf) < i + 5:
+                        break
+                    direction = buf[i + 2]
+                    rsize = buf[i + 3]
+                    c = buf[i + 4]
+                    end = i + 6 + rsize
+                    if len(buf) < end:
+                        break
+                    rpayload = bytes(buf[i + 5:i + 5 + rsize])
+                    chk = buf[i + 5 + rsize]
+                    calc = rsize ^ c
+                    for b in rpayload:
+                        calc ^= b
+                    del buf[:end]
+                    if calc != chk or c != cmd:
+                        continue
+                    if direction == 0x21:  # '!' error reply
+                        return False
+                    if direction == 0x3E:  # '>' normal reply (ack)
+                        return True
+            return False
+
+    @staticmethod
+    def _crc8_dvb_s2(crc: int, data: bytes) -> int:
+        """CRC8/DVB-S2, poly 0xD5. Matches INAV's crc8_dvb_s2() in
+        src/main/common/crc.c exactly (source-verified)."""
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                if crc & 0x80:
+                    crc = ((crc << 1) ^ 0xD5) & 0xFF
+                else:
+                    crc = (crc << 1) & 0xFF
+        return crc
+
+    def _msp2_request(self, cmd: int, payload: bytes = b"", timeout: float = 0.5) -> Optional[bytes]:
+        """MSP v2 native ($X) request/response. Separate from v1 _msp_request/
+        _msp_send -- does not modify verified v1 telemetry/RC-override code.
+        Used for commands like MSP2_INAV_STATUS (0x2000) exposing full 32-bit
+        armingFlags not available/truncated in the v1 MSP_STATUS_EX command."""
+        ser = self.ser
+        if ser is None:
+            raise serial.SerialException("serial port is not open")
+        size = len(payload)
+        header = struct.pack("<BHH", 0, cmd, size)
+        crc = self._crc8_dvb_s2(0, header)
+        crc = self._crc8_dvb_s2(crc, payload)
+        packet = b"$X<" + header + payload + bytes([crc])
+        with self.write_lock:
+            ser.reset_input_buffer()
+            ser.write(packet)
+            deadline = time.monotonic() + timeout
+            buf = bytearray()
+            while time.monotonic() < deadline:
+                buf += ser.read(ser.in_waiting or 1)
+                while True:
+                    i = buf.find(b"$X")
+                    if i < 0:
+                        if len(buf) > 64:
+                            del buf[:-1]
+                        break
+                    if len(buf) < i + 8:
+                        break
+                    direction = buf[i + 2]
+                    _, rcmd, rsize = struct.unpack("<BHH", bytes(buf[i + 3:i + 8]))
+                    end = i + 8 + rsize + 1
+                    if len(buf) < end:
+                        break
+                    rpayload = bytes(buf[i + 8:i + 8 + rsize])
+                    rcrc = buf[i + 8 + rsize]
+                    calc = self._crc8_dvb_s2(0, bytes(buf[i + 3:i + 8]))
+                    calc = self._crc8_dvb_s2(calc, rpayload)
+                    del buf[:end]
+                    if calc != rcrc or rcmd != cmd:
+                        continue
+                    if direction == 0x21:
+                        return None
+                    if direction == 0x3E:
+                        return rpayload
+            return None
+
+
     def _open(self):
         self.log(f"Opening INAV MSP on {self.port} @ {self.baud}")
         self.ser = serial.Serial(self.port, self.baud, timeout=0.1)
@@ -196,6 +357,9 @@ class InavBridge:
         if now >= self._next_analog:
             self._poll(MSP_ANALOG, self._on_analog)
             self._next_analog = now + 1.0
+        if now >= self._next_arm:
+            self._poll_arming()
+            self._next_arm = now + 0.5
         if time.monotonic() - self.last_msg_monotonic > 3.0:
             raise TimeoutError("No valid MSP replies for 3 s")
         self.stop_event.wait(0.05)
@@ -235,6 +399,17 @@ class InavBridge:
             self.state["groundspeed_mps"] = round(spd / 100.0, 2) if has_fix else None
             self._stamp_locked("GPS_RAW_INT")
 
+    def _poll_arming(self):
+        # Read-only: same MSP2_INAV_STATUS read and armed bit (bit 2) as is_armed().
+        flags = self.get_arming_flags()
+        with self.state_lock:
+            self.state["armed"] = None if flags is None else bool(flags & (1 << 2))
+        if self.rc_paused and flags is not None and not (flags & (1 << 2)):
+            with self.rc_lock:
+                self.rc_channels = [1500, 1500, 1000, 1500, 1000, 1000, 1000, 1000]
+            self.rc_paused = False
+            self.log("FC disarmed after RC pause; RC stream resumed at safe idle", "WARN")
+
     def _on_analog(self, p: bytes):
         if len(p) < 7:
             return
@@ -243,6 +418,28 @@ class InavBridge:
             self.state["voltage_v"] = round(vbat / 10.0, 1)  # 8-bit field, max 25.5 V
             self.state["current_a"] = round(amps / 100.0, 2)
             self._stamp_locked("SYS_STATUS")
+
+    def update_crop_health(self, crop: str, healthy: float, wilting: float, disease: float, pest: float):
+        """Update crop-health analytics from the Edge-AI inference pipeline."""
+        crop = crop.lower()
+        if crop not in self.crop_health:
+            raise ValueError(f"Unsupported crop: {crop}")
+
+        vals = [healthy, wilting, disease, pest]
+        if any(v < 0 or v > 100 for v in vals):
+            raise ValueError("Crop-health values must be 0..100")
+
+        with self.state_lock:
+            self.crop_health[crop] = {
+                "healthy": round(float(healthy), 1),
+                "wilting": round(float(wilting), 1),
+                "disease": round(float(disease), 1),
+                "pest": round(float(pest), 1),
+            }
+
+        if disease >= 10 or pest >= 10:
+            self.log(f"{crop.upper()} alert: disease={disease:.1f}% pest={pest:.1f}%", "ALERT")
+
 
     # ---------- interface expected by main_backend.py ----------
     def snapshot(self) -> Dict[str, Any]:
@@ -286,10 +483,36 @@ class InavBridge:
         self._unsupported("Preflight check")
 
     def arm(self):
-        self._unsupported("ARM")
+        with self.rc_lock:
+            self.rc_channels[4] = 1800  # AUX1 (CH5) high = ARM, per Modes tab range 1700-2100
+        self.log("ARM requested (AUX1 -> 1800)")
 
     def disarm(self):
-        self._unsupported("DISARM")
+        with self.rc_lock:
+            self.rc_channels[4] = 1000  # AUX1 (CH5) low = DISARM
+            if self.rc_paused:
+                self.rc_channels = [1500, 1500, 1000, 1500, 1000, 1000, 1000, 1000]
+                self.rc_paused = False
+        self.log("DISARM requested (AUX1 -> 1000)")
+
+    def get_arming_flags(self) -> Optional[int]:
+        """Returns the full 32-bit armingFlags from MSP2_INAV_STATUS, or None
+        on failure. BLOCKING serial I/O -- callers on an asyncio event loop
+        must use asyncio.to_thread(). Verified mechanism: test_real_arm_cycle.py
+        (real hardware, this session)."""
+        import struct as _struct
+        raw = self._msp2_request(MSP2_INAV_STATUS, timeout=0.3)
+        if raw is None or len(raw) < 13:
+            return None
+        _, _, _, _, _, armf = _struct.unpack_from("<HHHHBI", raw, 0)
+        return armf
+
+    def is_armed(self) -> Optional[bool]:
+        """Convenience wrapper: True/False if a reading was obtained, else None."""
+        armf = self.get_arming_flags()
+        if armf is None:
+            return None
+        return bool(armf & (1 << 2))
 
     def set_mode(self, mode: str):
         self._unsupported(f"SET_MODE {mode}")
@@ -306,8 +529,22 @@ class InavBridge:
     def emergency_stop(self):
         self._unsupported("EMERGENCY STOP")
 
-    def manual_control(self, *args, **kwargs):
-        self._unsupported("Manual control")
+    def manual_control(self, roll: int = 1500, pitch: int = 1500,
+                        throttle: int = 1000, yaw: int = 1500):
+        # Channel order CORRECTED (empirically re-verified via full 32-bit
+        # MSP2_INAV_STATUS armingFlags, test_manual_control_mapping.py):
+        # INAV's active rcmap is the documented default {0,1,3,2} (AETR) --
+        # source-confirmed in rx.c/rx.h. Wire index 2 = THROTTLE, wire
+        # index 3 = YAW. The prior comment here ("index2=YAW, index3=
+        # THROTTLE") was WRONG -- based on an earlier test that was
+        # corrupted by the then-undiscovered RC_LINK truncation bug.
+        # Confirmed: old mapping left ARMING_DISABLED_THROTTLE permanently
+        # set; this mapping produces a clean armingFlags == 0x00000000.
+        with self.rc_lock:
+            self.rc_channels[0] = roll
+            self.rc_channels[1] = pitch
+            self.rc_channels[2] = throttle
+            self.rc_channels[3] = yaw
 
 
 if __name__ == "__main__":
